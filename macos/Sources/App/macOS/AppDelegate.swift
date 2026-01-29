@@ -96,7 +96,7 @@ class AppDelegate: NSObject,
     private var derivedConfig: DerivedConfig = DerivedConfig()
 
     /// The ghostty global state. Only one per process.
-    let ghostty: Ghostty.App = Ghostty.App()
+    let ghostty: Ghostty.App
 
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
@@ -155,6 +155,11 @@ class AppDelegate: NSObject,
     @Published private(set) var appIcon: NSImage? = nil
 
     override init() {
+#if DEBUG
+        ghostty = Ghostty.App(configPath: ProcessInfo.processInfo.environment["GHOSTTY_CONFIG_PATH"])
+#else
+        ghostty = Ghostty.App()
+#endif
         super.init()
 
         ghostty.delegate = self
@@ -946,33 +951,8 @@ class AppDelegate: NSObject,
         var appIconName: String? = config.macosIcon.rawValue
 
         switch (config.macosIcon) {
-        case .official:
-            // Discard saved icon name
-            appIconName = nil
-            break
-        case .blueprint:
-            appIcon = NSImage(named: "BlueprintImage")!
-
-        case .chalkboard:
-            appIcon = NSImage(named: "ChalkboardImage")!
-
-        case .glass:
-            appIcon = NSImage(named: "GlassImage")!
-
-        case .holographic:
-            appIcon = NSImage(named: "HolographicImage")!
-
-        case .microchip:
-            appIcon = NSImage(named: "MicrochipImage")!
-
-        case .paper:
-            appIcon = NSImage(named: "PaperImage")!
-
-        case .retro:
-            appIcon = NSImage(named: "RetroImage")!
-
-        case .xray:
-            appIcon = NSImage(named: "XrayImage")!
+        case let icon where icon.assetName != nil:
+            appIcon = NSImage(named: icon.assetName!)!
 
         case .custom:
             if let userIcon = NSImage(contentsOfFile: config.macosCustomIcon) {
@@ -982,6 +962,7 @@ class AppDelegate: NSObject,
                 appIcon = nil // Revert back to official icon if invalid location
                 appIconName = nil // Discard saved icon name
             }
+
         case .customStyle:
             // Discard saved icon name
             // if no valid colours were found
@@ -997,6 +978,10 @@ class AppDelegate: NSObject,
             let colorStrings = ([ghostColor] + screenColors).compactMap(\.hexString)
             appIconName = (colorStrings + [config.macosIconFrame.rawValue])
                 .joined(separator: "_")
+
+        default:
+            // Discard saved icon name
+            appIconName = nil
         }
 
         // Only change the icon if it has actually changed from the current one,

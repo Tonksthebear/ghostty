@@ -733,8 +733,9 @@ pub const Application = extern struct {
             .toggle_split_zoom => return Action.toggleSplitZoom(target),
             .show_on_screen_keyboard => return Action.showOnScreenKeyboard(target),
             .command_finished => return Action.commandFinished(target, value),
+            .readonly => return Action.setReadonly(target, value),
 
-            .start_search => Action.startSearch(target),
+            .start_search => Action.startSearch(target, value),
             .end_search => Action.endSearch(target),
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
@@ -753,7 +754,6 @@ pub const Application = extern struct {
             .check_for_updates,
             .undo,
             .redo,
-            .readonly,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;
@@ -2400,9 +2400,13 @@ const Action = struct {
                     SplitTree,
                     surface.as(gtk.Widget),
                 ) orelse {
-                    log.warn("surface is not in a split tree, ignoring goto_split", .{});
+                    log.warn("surface is not in a split tree, ignoring resize_split", .{});
                     return false;
                 };
+
+                // If the tree has no splits (only one leaf), this action is not performable.
+                // This allows the key event to pass through to the terminal.
+                if (!tree.getIsSplit()) return false;
 
                 return tree.resize(
                     switch (value.direction) {
@@ -2439,17 +2443,17 @@ const Action = struct {
         }
     }
 
-    pub fn startSearch(target: apprt.Target) void {
+    pub fn startSearch(target: apprt.Target, value: apprt.action.StartSearch) void {
         switch (target) {
             .app => {},
-            .surface => |v| v.rt_surface.surface.setSearchActive(true),
+            .surface => |v| v.rt_surface.surface.setSearchActive(true, value.needle),
         }
     }
 
     pub fn endSearch(target: apprt.Target) void {
         switch (target) {
             .app => {},
-            .surface => |v| v.rt_surface.surface.setSearchActive(false),
+            .surface => |v| v.rt_surface.surface.setSearchActive(false, ""),
         }
     }
 
@@ -2550,6 +2554,18 @@ const Action = struct {
             .surface => |core| {
                 // TODO: pass surface ID when we have that
                 const surface = core.rt_surface.surface;
+                const tree = ext.getAncestor(
+                    SplitTree,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a split tree, ignoring toggle_split_zoom", .{});
+                    return false;
+                };
+
+                // If the tree has no splits (only one leaf), this action is not performable.
+                // This allows the key event to pass through to the terminal.
+                if (!tree.getIsSplit()) return false;
+
                 return surface.as(gtk.Widget).activateAction("split-tree.zoom", null) != 0;
             },
         }
@@ -2658,6 +2674,15 @@ const Action = struct {
             .app => return false,
             .surface => |surface| {
                 return surface.rt_surface.gobj().commandFinished(value);
+            },
+        }
+    }
+
+    pub fn setReadonly(target: apprt.Target, value: apprt.Action.Value(.readonly)) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().setReadonly(value);
             },
         }
     }

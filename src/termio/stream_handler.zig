@@ -119,7 +119,7 @@ pub const StreamHandler = struct {
         };
 
         // The config could have changed any of our colors so update mode 2031
-        self.surfaceMessageWriter(.{ .report_color_scheme = false });
+        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
     }
 
     inline fn surfaceMessageWriter(
@@ -198,8 +198,8 @@ pub const StreamHandler = struct {
             .print_repeat => try self.terminal.printRepeat(value),
             .bell => self.bell(),
             .backspace => self.terminal.backspace(),
-            .horizontal_tab => try self.horizontalTab(value),
-            .horizontal_tab_back => try self.horizontalTabBack(value),
+            .horizontal_tab => self.horizontalTab(value),
+            .horizontal_tab_back => self.horizontalTabBack(value),
             .linefeed => {
                 @branchHint(.likely);
                 try self.linefeed();
@@ -311,8 +311,6 @@ pub const StreamHandler = struct {
             },
             .kitty_color_report => try self.kittyColorReport(value),
             .color_operation => try self.colorOperation(value.op, &value.requests, value.terminator),
-            .prompt_end => try self.promptEnd(),
-            .end_of_input => try self.endOfInput(),
             .end_hyperlink => try self.endHyperlink(),
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.decaln(),
@@ -322,9 +320,7 @@ pub const StreamHandler = struct {
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
-            .prompt_start => self.promptStart(value.aid, value.redraw),
-            .prompt_continuation => self.promptContinuation(value.aid),
-            .end_of_command => self.endOfCommand(value.exit_code),
+            .semantic_prompt => self.semanticPrompt(value),
             .mouse_shape => try self.setMouseShape(value),
             .configure_charset => self.configureCharset(value.slot, value.charset),
             .set_attribute => {
@@ -398,11 +394,16 @@ pub const StreamHandler = struct {
                         break :tmux;
                     },
 
-                    .exit => if (self.tmux_viewer) |viewer| {
-                        // Free our viewer state
-                        viewer.deinit();
-                        self.alloc.destroy(viewer);
-                        self.tmux_viewer = null;
+                    .exit => {
+                        // Free our viewer state if we have one
+                        if (self.tmux_viewer) |viewer| {
+                            viewer.deinit();
+                            self.alloc.destroy(viewer);
+                            self.tmux_viewer = null;
+                        }
+
+                        // And always break since we assert below
+                        // that we're not handling an exit command.
                         break :tmux;
                     },
 
@@ -555,18 +556,18 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.ring_bell);
     }
 
-    inline fn horizontalTab(self: *StreamHandler, count: u16) !void {
+    inline fn horizontalTab(self: *StreamHandler, count: u16) void {
         for (0..count) |_| {
             const x = self.terminal.screens.active.cursor.x;
-            try self.terminal.horizontalTab();
+            self.terminal.horizontalTab();
             if (x == self.terminal.screens.active.cursor.x) break;
         }
     }
 
-    inline fn horizontalTabBack(self: *StreamHandler, count: u16) !void {
+    inline fn horizontalTabBack(self: *StreamHandler, count: u16) void {
         for (0..count) |_| {
             const x = self.terminal.screens.active.cursor.x;
-            try self.terminal.horizontalTabBack();
+            self.terminal.horizontalTabBack();
             if (x == self.terminal.screens.active.cursor.x) break;
         }
     }
@@ -716,7 +717,7 @@ pub const StreamHandler = struct {
                 if (enabled) {
                     self.terminal.saveCursor();
                 } else {
-                    try self.terminal.restoreCursor();
+                    self.terminal.restoreCursor();
                 }
             },
 
@@ -866,7 +867,7 @@ pub const StreamHandler = struct {
                 self.messageWriter(msg);
             },
 
-            .color_scheme => self.surfaceMessageWriter(.{ .report_color_scheme = true }),
+            .color_scheme => self.messageWriter(.{ .color_scheme_report = .{ .force = true } }),
         }
     }
 
@@ -928,7 +929,7 @@ pub const StreamHandler = struct {
     }
 
     pub inline fn restoreCursor(self: *StreamHandler) !void {
-        try self.terminal.restoreCursor();
+        self.terminal.restoreCursor();
     }
 
     pub fn enquiry(self: *StreamHandler) !void {
@@ -951,7 +952,7 @@ pub const StreamHandler = struct {
         try self.setMouseShape(.text);
 
         // Reset resets our palette so we report it for mode 2031.
-        self.surfaceMessageWriter(.{ .report_color_scheme = false });
+        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
 
         // Clear the progress bar
         self.progressReport(.{ .state = .remove });
@@ -1065,28 +1066,53 @@ pub const StreamHandler = struct {
         });
     }
 
-    inline fn promptStart(self: *StreamHandler, aid: ?[]const u8, redraw: bool) void {
-        _ = aid;
-        self.terminal.markSemanticPrompt(.prompt);
-        self.terminal.flags.shell_redraws_prompt = redraw;
-    }
+    fn semanticPrompt(
+        self: *StreamHandler,
+        cmd: Stream.Action.SemanticPrompt,
+    ) void {
+        switch (cmd.action) {
+            .fresh_line_new_prompt => {
+                const kind = cmd.readOption(.prompt_kind) orelse .initial;
+                switch (kind) {
+                    .initial, .right => {
+                        self.terminal.markSemanticPrompt(.prompt);
+                        if (cmd.readOption(.redraw)) |redraw| {
+                            self.terminal.flags.shell_redraws_prompt = redraw;
+                        }
+                    },
+                    .continuation, .secondary => {
+                        self.terminal.markSemanticPrompt(.prompt_continuation);
+                    },
+                }
+            },
 
-    inline fn promptContinuation(self: *StreamHandler, aid: ?[]const u8) void {
-        _ = aid;
-        self.terminal.markSemanticPrompt(.prompt_continuation);
-    }
+            .end_prompt_start_input => self.terminal.markSemanticPrompt(.input),
+            .end_input_start_output => {
+                self.terminal.markSemanticPrompt(.command);
+                self.surfaceMessageWriter(.start_command);
+            },
+            .end_command => {
+                // The specification seems to not specify the type but
+                // other terminals accept 32-bits, but exit codes are really
+                // bytes, so we just do our best here.
+                const code: u8 = code: {
+                    const raw: i32 = cmd.readOption(.exit_code) orelse 0;
+                    break :code std.math.cast(u8, raw) orelse 1;
+                };
 
-    pub inline fn promptEnd(self: *StreamHandler) !void {
-        self.terminal.markSemanticPrompt(.input);
-    }
+                self.surfaceMessageWriter(.{ .stop_command = code });
+            },
 
-    pub inline fn endOfInput(self: *StreamHandler) !void {
-        self.terminal.markSemanticPrompt(.command);
-        self.surfaceMessageWriter(.start_command);
-    }
-
-    inline fn endOfCommand(self: *StreamHandler, exit_code: ?u8) void {
-        self.surfaceMessageWriter(.{ .stop_command = exit_code });
+            // All of these commands weren't previously handled by our
+            // semantic prompt code. I am PR-ing the parser separate from the
+            // handling so we just ignore these like we did before, even
+            // though we should handle them eventually.
+            .end_prompt_start_input_terminate_eol,
+            .fresh_line,
+            .new_command,
+            .prompt_start,
+            => {},
+        }
     }
 
     fn reportPwd(self: *StreamHandler, url: []const u8) !void {

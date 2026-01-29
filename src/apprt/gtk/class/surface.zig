@@ -19,6 +19,7 @@ const terminal = @import("../../../terminal/main.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const gresource = @import("../build/gresource.zig");
 const ext = @import("../ext.zig");
+const gsettings = @import("../gsettings.zig");
 const gtk_key = @import("../key.zig");
 const ApprtSurface = @import("../Surface.zig");
 const Common = @import("../class.zig").Common;
@@ -399,6 +400,25 @@ pub const Surface = extern struct {
                 },
             );
         };
+
+        pub const readonly = struct {
+            pub const name = "readonly";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        bool,
+                        .{
+                            .getter = getReadonly,
+                        },
+                    ),
+                },
+            );
+        };
     };
 
     pub const signals = struct {
@@ -673,6 +693,9 @@ pub const Surface = extern struct {
 
         /// The context for this surface (window, tab, or split)
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Whether primary paste (middle-click paste) is enabled.
+        gtk_enable_primary_paste: bool = true,
 
         pub var offset: c_int = 0;
     };
@@ -1102,6 +1125,20 @@ pub const Surface = extern struct {
         return true;
     }
 
+    /// Get the readonly state from the core surface.
+    pub fn getReadonly(self: *Self) bool {
+        const priv: *Private = self.private();
+        const surface = priv.core_surface orelse return false;
+        return surface.readonly;
+    }
+
+    /// Notify anyone interested that the readonly status has changed.
+    pub fn setReadonly(self: *Self, _: apprt.Action.Value(.readonly)) bool {
+        self.as(gobject.Object).notifyByPspec(properties.readonly.impl.param_spec);
+
+        return true;
+    }
+
     /// Key press event (press or release).
     ///
     /// At a high level, we want to construct an `input.KeyEvent` and
@@ -1511,19 +1548,17 @@ pub const Surface = extern struct {
         const xft_dpi_scale = xft_scale: {
             // gtk-xft-dpi is font DPI multiplied by 1024. See
             // https://docs.gtk.org/gtk4/property.Settings.gtk-xft-dpi.html
-            const settings = gtk.Settings.getDefault() orelse break :xft_scale 1.0;
-            var value = std.mem.zeroes(gobject.Value);
-            defer value.unset();
-            _ = value.init(gobject.ext.typeFor(c_int));
-            settings.as(gobject.Object).getProperty("gtk-xft-dpi", &value);
-            const gtk_xft_dpi = value.getInt();
+            const gtk_xft_dpi = gsettings.get(.@"gtk-xft-dpi") orelse {
+                log.warn("gtk-xft-dpi was not set, using default value", .{});
+                break :xft_scale 1.0;
+            };
 
             // Use a value of 1.0 for the XFT DPI scale if the setting is <= 0
             // See:
             // https://gitlab.gnome.org/GNOME/libadwaita/-/commit/a7738a4d269bfdf4d8d5429ca73ccdd9b2450421
             // https://gitlab.gnome.org/GNOME/libadwaita/-/commit/9759d3fd81129608dd78116001928f2aed974ead
             if (gtk_xft_dpi <= 0) {
-                log.warn("gtk-xft-dpi was not set, using default value", .{});
+                log.warn("gtk-xft-dpi has invalid value ({}), using default", .{gtk_xft_dpi});
                 break :xft_scale 1.0;
             }
 
@@ -1766,6 +1801,9 @@ pub const Surface = extern struct {
         priv.in_keyevent = .false;
         priv.im_composing = false;
         priv.im_len = 0;
+
+        // Read GTK primary paste setting
+        priv.gtk_enable_primary_paste = gsettings.get(.@"gtk-enable-primary-paste") orelse true;
 
         // Set up to handle items being dropped on our surface. Files can be dropped
         // from Nautilus and strings can be dropped from many programs. The order
@@ -2091,7 +2129,7 @@ pub const Surface = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.@"error".impl.param_spec);
     }
 
-    pub fn setSearchActive(self: *Self, active: bool) void {
+    pub fn setSearchActive(self: *Self, active: bool, needle: [:0]const u8) void {
         const priv = self.private();
         var value = gobject.ext.Value.newFrom(active);
         defer value.unset();
@@ -2100,6 +2138,10 @@ pub const Surface = extern struct {
             SearchOverlay.properties.active.name,
             &value,
         );
+
+        if (!std.mem.eql(u8, needle, "")) {
+            priv.search_overlay.setSearchContents(needle);
+        }
 
         if (active) {
             priv.search_overlay.grabFocus();
@@ -2681,6 +2723,11 @@ pub const Surface = extern struct {
 
         // Report the event
         const button = translateMouseButton(gesture.as(gtk.GestureSingle).getCurrentButton());
+
+        if (button == .middle and !priv.gtk_enable_primary_paste) {
+            return;
+        }
+
         const consumed = consumed: {
             const gtk_mods = event.getModifierState();
             const mods = gtk_key.translateMods(gtk_mods);
@@ -2731,6 +2778,10 @@ pub const Surface = extern struct {
         const surface = priv.core_surface orelse return;
         const gtk_mods = event.getModifierState();
         const button = translateMouseButton(gesture.as(gtk.GestureSingle).getCurrentButton());
+
+        if (button == .middle and !priv.gtk_enable_primary_paste) {
+            return;
+        }
 
         const mods = gtk_key.translateMods(gtk_mods);
         const consumed = surface.mouseButtonCallback(
@@ -3462,6 +3513,7 @@ pub const Surface = extern struct {
                 properties.@"title-override".impl,
                 properties.zoom.impl,
                 properties.@"is-split".impl,
+                properties.readonly.impl,
 
                 // For Gtk.Scrollable
                 properties.hadjustment.impl,
