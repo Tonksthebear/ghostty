@@ -64,8 +64,8 @@
     forAllPlatforms = f: lib.genAttrs platforms (s: f legacyPackages.${s});
     forBuildablePlatforms = f: lib.genAttrs buildablePlatforms (s: f legacyPackages.${s});
   in {
-    devShell = forAllPlatforms (pkgs:
-      pkgs.callPackage ./nix/devShell.nix {
+    devShells = forAllPlatforms (pkgs: {
+      default = pkgs.callPackage ./nix/devShell.nix {
         zig = zig.packages.${pkgs.stdenv.hostPlatform.system}."0.15.2";
         wraptest = pkgs.callPackage ./nix/pkgs/wraptest.nix {};
         zon2nix = zon2nix;
@@ -77,7 +77,8 @@
             ucs-detect = pyfinal.callPackage ./nix/pkgs/ucs-detect.nix {};
           };
         };
-      });
+      };
+    });
 
     packages =
       forAllPlatforms (pkgs: {
@@ -101,7 +102,7 @@
     formatter = forAllPlatforms (pkgs: pkgs.alejandra);
 
     apps = forBuildablePlatforms (pkgs: let
-      runVM = module: desc: let
+      runVM = module: let
         vm = import ./nix/vm/create.nix {
           inherit (pkgs.stdenv.hostPlatform) system;
           inherit module nixpkgs;
