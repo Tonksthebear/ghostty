@@ -1,16 +1,16 @@
 # Fork Notes
 
-This fork carries `libghostty-vt` work needed for Restty/Botster terminal state transfer and callback integration.
+This fork carries `libghostty-vt` work for app-agnostic terminal state transfer and callback integration.
 
 ## Why This Fork Exists
 
-The downstream clients needed Ghostty-native support for:
+Consumers of `libghostty-vt` needed Ghostty-native support for:
 
 - lossless binary terminal snapshot export/import
 - C API callback parity for terminal state changes already modeled in Ghostty
 - post-import state canonicalization so imported terminals are safe for immediate VT mutation
 
-These changes belong in Ghostty core because they affect terminal correctness and the `libghostty-vt` ABI, not just downstream transport code.
+These changes belong in Ghostty core because they affect terminal correctness and the `libghostty-vt` ABI, not any one client or transport implementation.
 
 ## What Changed
 
@@ -42,7 +42,7 @@ These are exposed with Ghostty-native semantics rather than downstream-specific 
 - Recomputed derived row flags from imported cell state
 - Fixed imported terminals so later VT operations like overwrite-at-cursor, clear-screen, and style mutation are immediately safe
 
-This specifically addressed native-exported snapshot -> wasm-imported mutation failures that rendered correctly but trapped on later writes.
+This specifically addressed cross-target snapshot-import cases where imported terminals rendered correctly but could trap on later writes because imported page metadata was not fully canonicalized.
 
 ### Fuzzing
 
@@ -57,7 +57,7 @@ zig build test -Demit-macos-app=false -Dtest-filter=snapshot
 zig build test -Demit-macos-app=false
 ```
 
-Additional local validation included snapshot fuzzing setup and downstream Restty/Botster integration against real production fixtures.
+Additional local validation included snapshot fuzzing setup and real integration against production snapshot fixtures.
 
 ## Downstream Expectations
 
