@@ -24,6 +24,7 @@ const sgr = @import("sgr.zig");
 const Tabstops = @import("Tabstops.zig");
 const color = @import("color.zig");
 const mouse = @import("mouse.zig");
+const snapshot = @import("snapshot.zig");
 const Stream = @import("stream_terminal.zig").Stream;
 
 const size = @import("size.zig");
@@ -263,6 +264,16 @@ pub fn vtHandler(self: *Terminal) Stream.Handler {
 /// The general allocator we should use for this terminal.
 pub fn gpa(self: *Terminal) Allocator {
     return self.screens.active.alloc;
+}
+
+pub fn snapshotExportAlloc(self: *const Terminal, alloc: Allocator) snapshot.Error![]u8 {
+    return snapshot.exportAlloc(self, alloc);
+}
+
+/// Import a full terminal snapshot. This must be called at a parser
+/// boundary; parser state is not serialized.
+pub fn snapshotImport(self: *Terminal, data: []const u8) snapshot.Error!void {
+    return snapshot.importInto(self, data);
 }
 
 /// Print UTF-8 encoded string to the terminal.

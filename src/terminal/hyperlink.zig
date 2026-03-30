@@ -108,7 +108,7 @@ pub const PageEntry = struct {
             @memcpy(buf, uri);
             copy.uri = .{
                 .offset = size.getOffset(u8, dst_page.memory, &buf[0]),
-                .len = uri.len,
+                .len = @intCast(uri.len),
             };
         }
         errdefer dst_page.string_alloc.free(
@@ -125,7 +125,7 @@ pub const PageEntry = struct {
                 @memcpy(buf, id);
                 copy.id = .{ .explicit = .{
                     .offset = size.getOffset(u8, dst_page.memory, &buf[0]),
-                    .len = id.len,
+                    .len = @intCast(id.len),
                 } };
             },
         }

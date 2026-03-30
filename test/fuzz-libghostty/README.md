@@ -9,6 +9,7 @@ libghostty-vt (Zig module).
 | -------- | ------------- | ------------------------------------------------------- |
 | `osc`    | `fuzz-osc`    | OSC parser with allocator (`osc.Parser.next` + `end`)   |
 | `parser` | `fuzz-parser` | VT parser only (`Parser.next` byte-at-a-time)           |
+| `snapshot` | `fuzz-snapshot` | Binary terminal snapshot import/export (`snapshotImport`) |
 | `stream` | `fuzz-stream` | Full terminal stream (`nextSlice` + `next` via handler) |
 
 The osc target directly fuzzes the `osc.Parser` with an allocator enabled,
@@ -20,6 +21,11 @@ The stream target creates a small `Terminal` and exercises the readonly
 `Stream` handler, covering printing, CSI dispatch, OSC, DCS, SGR, cursor
 movement, scrolling regions, and more. The first byte of each input selects
 between the slice path (SIMD fast-path) and the scalar path.
+
+The snapshot target creates a terminal with fuzz-selected dimensions, feeds
+the remaining bytes to `snapshotImport`, and re-exports on success. This
+covers malformed snapshot validation, temp-build-and-swap import behavior, and
+round-trip stability for any valid blobs the fuzzer discovers.
 
 ## Prerequisites
 
@@ -39,7 +45,8 @@ zig build
 
 This compiles Zig static libraries for each fuzz target, emits LLVM bitcode,
 then links each with `afl.c` using `afl-cc` to produce instrumented binaries
-at `zig-out/bin/fuzz-osc`, `zig-out/bin/fuzz-parser`, and `zig-out/bin/fuzz-stream`.
+at `zig-out/bin/fuzz-osc`, `zig-out/bin/fuzz-parser`, `zig-out/bin/fuzz-snapshot`,
+and `zig-out/bin/fuzz-stream`.
 
 ## Running the Fuzzer
 
@@ -48,6 +55,7 @@ Each target has its own run step:
 ```sh
 zig build run-osc       # Run the OSC parser fuzzer
 zig build run-parser    # Run the VT parser fuzzer
+zig build run-snapshot  # Run the snapshot import/export fuzzer
 zig build run-stream    # Run the VT stream fuzzer
 ```
 
@@ -129,5 +137,6 @@ rename the output files to replace colons with underscores before committing:
 | `corpus/osc-cmin/`       | Output of `afl-cmin` (edge-deduplicated corpus) |
 | `corpus/parser-initial/` | Hand-written seed inputs for vt-parser          |
 | `corpus/parser-cmin/`    | Output of `afl-cmin` (edge-deduplicated corpus) |
+| `corpus/snapshot-cmin/`  | Seed inputs for binary snapshot import          |
 | `corpus/stream-initial/` | Hand-written seed inputs for vt-stream          |
 | `corpus/stream-cmin/`    | Output of `afl-cmin` (edge-deduplicated corpus) |

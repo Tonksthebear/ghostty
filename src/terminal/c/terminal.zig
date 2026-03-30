@@ -4,6 +4,7 @@ const lib = @import("../lib.zig");
 const CAllocator = lib.alloc.Allocator;
 const ZigTerminal = @import("../Terminal.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
+const osc = @import("../osc.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
 const kitty = @import("../kitty/key.zig");
@@ -16,6 +17,7 @@ const size_report = @import("../size_report.zig");
 const cell_c = @import("cell.zig");
 const row_c = @import("row.zig");
 const grid_ref_c = @import("grid_ref.zig");
+const allocator_c = @import("allocator.zig");
 const style_c = @import("style.zig");
 const color = @import("../color.zig");
 const Result = @import("result.zig").Result;
@@ -45,6 +47,11 @@ const Effects = struct {
     enquiry: ?EnquiryFn = null,
     xtversion: ?XtversionFn = null,
     title_changed: ?TitleChangedFn = null,
+    pwd_changed: ?PwdChangedFn = null,
+    notification: ?NotificationFn = null,
+    semantic_prompt_changed: ?SemanticPromptChangedFn = null,
+    mode_changed: ?ModeChangedFn = null,
+    kitty_keyboard_changed: ?KittyKeyboardChangedFn = null,
     size_cb: ?SizeFn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
@@ -78,6 +85,28 @@ const Effects = struct {
 
     /// C function pointer type for the title_changed callback.
     pub const TitleChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for the pwd_changed callback.
+    pub const PwdChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for desktop notifications (OSC 9/777).
+    pub const NotificationFn = *const fn (
+        Terminal,
+        ?*anyopaque,
+        [*]const u8,
+        usize,
+        [*]const u8,
+        usize,
+    ) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for semantic prompt changes (OSC 133).
+    pub const SemanticPromptChangedFn = *const fn (Terminal, ?*anyopaque, SemanticPromptAction) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for terminal mode changes.
+    pub const ModeChangedFn = *const fn (Terminal, ?*anyopaque, modes.ModeTag.Backing, bool) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for kitty keyboard changes.
+    pub const KittyKeyboardChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the size callback.
     /// Returns true and fills out_size if size is available,
@@ -192,6 +221,58 @@ const Effects = struct {
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
+    fn pwdChangedTrampoline(handler: *Handler) void {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const func = wrapper.effects.pwd_changed orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata);
+    }
+
+    fn notificationTrampoline(handler: *Handler, title: []const u8, body: []const u8) void {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const func = wrapper.effects.notification orelse return;
+        const empty = "";
+        func(
+            @ptrCast(wrapper),
+            wrapper.effects.userdata,
+            if (title.len > 0) title.ptr else empty.ptr,
+            title.len,
+            if (body.len > 0) body.ptr else empty.ptr,
+            body.len,
+        );
+    }
+
+    fn semanticPromptChangedTrampoline(handler: *Handler, action: osc.Command.SemanticPrompt.Action) void {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const func = wrapper.effects.semantic_prompt_changed orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata, switch (action) {
+            .fresh_line => .fresh_line,
+            .fresh_line_new_prompt => .fresh_line_new_prompt,
+            .new_command => .new_command,
+            .prompt_start => .prompt_start,
+            .end_prompt_start_input => .end_prompt_start_input,
+            .end_prompt_start_input_terminate_eol => .end_prompt_start_input_terminate_eol,
+            .end_input_start_output => .end_input_start_output,
+            .end_command => .end_command,
+        });
+    }
+
+    fn modeChangedTrampoline(handler: *Handler, mode: modes.ModeTag.Backing, enabled: bool) void {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const func = wrapper.effects.mode_changed orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata, mode, enabled);
+    }
+
+    fn kittyKeyboardChangedTrampoline(handler: *Handler) void {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const func = wrapper.effects.kitty_keyboard_changed orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata);
+    }
+
     fn sizeTrampoline(handler: *Handler) ?size_report.Size {
         const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
         const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
@@ -204,6 +285,18 @@ const Effects = struct {
 
 /// C: GhosttyTerminal
 pub const Terminal = ?*TerminalWrapper;
+
+/// C: GhosttySemanticPromptAction
+pub const SemanticPromptAction = enum(c_int) {
+    fresh_line = 0,
+    fresh_line_new_prompt = 1,
+    new_command = 2,
+    prompt_start = 3,
+    end_prompt_start_input = 4,
+    end_prompt_start_input_terminate_eol = 5,
+    end_input_start_output = 6,
+    end_command = 7,
+};
 
 /// C: GhosttyTerminalOptions
 pub const Options = extern struct {
@@ -265,6 +358,11 @@ fn new_(
         .color_scheme = &Effects.colorSchemeTrampoline,
         .device_attributes = &Effects.deviceAttributesTrampoline,
         .enquiry = &Effects.enquiryTrampoline,
+        .kitty_keyboard_changed = &Effects.kittyKeyboardChangedTrampoline,
+        .mode_changed = &Effects.modeChangedTrampoline,
+        .notification = &Effects.notificationTrampoline,
+        .pwd_changed = &Effects.pwdChangedTrampoline,
+        .semantic_prompt = &Effects.semanticPromptChangedTrampoline,
         .xtversion = &Effects.xtversionTrampoline,
         .title_changed = &Effects.titleChangedTrampoline,
         .size = &Effects.sizeTrampoline,
@@ -304,6 +402,11 @@ pub const Option = enum(c_int) {
     color_background = 12,
     color_cursor = 13,
     color_palette = 14,
+    pwd_changed = 15,
+    notification = 16,
+    semantic_prompt = 17,
+    mode_changed = 18,
+    kitty_keyboard_changed = 19,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -316,6 +419,11 @@ pub const Option = enum(c_int) {
             .enquiry => ?Effects.EnquiryFn,
             .xtversion => ?Effects.XtversionFn,
             .title_changed => ?Effects.TitleChangedFn,
+            .pwd_changed => ?Effects.PwdChangedFn,
+            .notification => ?Effects.NotificationFn,
+            .semantic_prompt => ?Effects.SemanticPromptChangedFn,
+            .mode_changed => ?Effects.ModeChangedFn,
+            .kitty_keyboard_changed => ?Effects.KittyKeyboardChangedFn,
             .size_cb => ?Effects.SizeFn,
             .title, .pwd => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
@@ -361,6 +469,11 @@ fn setTyped(
         .enquiry => wrapper.effects.enquiry = value,
         .xtversion => wrapper.effects.xtversion = value,
         .title_changed => wrapper.effects.title_changed = value,
+        .pwd_changed => wrapper.effects.pwd_changed = value,
+        .notification => wrapper.effects.notification = value,
+        .semantic_prompt => wrapper.effects.semantic_prompt_changed = value,
+        .mode_changed => wrapper.effects.mode_changed = value,
+        .kitty_keyboard_changed => wrapper.effects.kitty_keyboard_changed = value,
         .size_cb => wrapper.effects.size_cb = value,
         .title => {
             const str = if (value) |v| v.ptr[0..v.len] else "";
@@ -623,6 +736,57 @@ pub fn grid_ref(
     return .success;
 }
 
+pub fn snapshot_export(
+    terminal_: Terminal,
+    alloc_: ?*const CAllocator,
+    out_ptr: ?*?[*]u8,
+    out_len: ?*usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const ptr = out_ptr orelse return .invalid_value;
+    const len = out_len orelse return .invalid_value;
+    const alloc = lib.alloc.default(alloc_);
+    if (!wrapper.stream.isIdle()) return .invalid_value;
+
+    const buf = wrapper.terminal.snapshotExportAlloc(alloc) catch |err| return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.InvalidSnapshot => .invalid_value,
+    };
+
+    ptr.* = buf.ptr;
+    len.* = buf.len;
+    return .success;
+}
+
+pub fn snapshot_import(
+    terminal_: Terminal,
+    ptr: ?[*]const u8,
+    len: usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const data = ptr orelse {
+        if (len == 0) return .invalid_value;
+        return .invalid_value;
+    };
+    if (len == 0) return .invalid_value;
+
+    wrapper.terminal.snapshotImport(data[0..len]) catch |err| return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.InvalidSnapshot => .invalid_value,
+    };
+
+    reset_stream(wrapper);
+    return .success;
+}
+
+fn reset_stream(wrapper: *TerminalWrapper) void {
+    const alloc = wrapper.terminal.gpa();
+    var handler = wrapper.stream.handler;
+    wrapper.stream.deinit();
+    handler.terminal = wrapper.terminal;
+    wrapper.stream = .initAlloc(alloc, handler);
+}
+
 pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     const t = wrapper.terminal;
@@ -759,6 +923,139 @@ test "reset" {
 
 test "reset null" {
     reset(null);
+}
+
+test "snapshot export/import round trip" {
+    var src: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &src,
+        .{
+            .cols = 5,
+            .rows = 2,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer free(src);
+
+    vt_write(src, "hello\r\nworld", 12);
+
+    var snapshot_ptr: ?[*]u8 = null;
+    var snapshot_len: usize = 0;
+    try testing.expectEqual(Result.success, snapshot_export(
+        src,
+        &lib.alloc.test_allocator,
+        &snapshot_ptr,
+        &snapshot_len,
+    ));
+    defer allocator_c.free(&lib.alloc.test_allocator, snapshot_ptr, snapshot_len);
+
+    var dst: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &dst,
+        .{
+            .cols = 10,
+            .rows = 4,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(dst);
+
+    try testing.expectEqual(Result.success, snapshot_import(
+        dst,
+        snapshot_ptr,
+        snapshot_len,
+    ));
+
+    const src_str = try src.?.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(src_str);
+    const dst_str = try dst.?.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(dst_str);
+    try testing.expectEqualStrings(src_str, dst_str);
+
+    var round_ptr: ?[*]u8 = null;
+    var round_len: usize = 0;
+    try testing.expectEqual(Result.success, snapshot_export(
+        dst,
+        &lib.alloc.test_allocator,
+        &round_ptr,
+        &round_len,
+    ));
+    defer allocator_c.free(&lib.alloc.test_allocator, round_ptr, round_len);
+
+    try testing.expectEqual(snapshot_len, round_len);
+    try testing.expectEqualSlices(u8, snapshot_ptr.?[0..snapshot_len], round_ptr.?[0..round_len]);
+}
+
+test "snapshot export rejects partial control sequence" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 5,
+            .rows = 2,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer free(t);
+
+    vt_write(t, "\x1b[", 2);
+
+    var snapshot_ptr: ?[*]u8 = null;
+    var snapshot_len: usize = 0;
+    try testing.expectEqual(Result.invalid_value, snapshot_export(
+        t,
+        &lib.alloc.test_allocator,
+        &snapshot_ptr,
+        &snapshot_len,
+    ));
+
+    vt_write(t, "31mhi", 5);
+
+    try testing.expectEqual(Result.success, snapshot_export(
+        t,
+        &lib.alloc.test_allocator,
+        &snapshot_ptr,
+        &snapshot_len,
+    ));
+    defer allocator_c.free(&lib.alloc.test_allocator, snapshot_ptr, snapshot_len);
+}
+
+test "snapshot export rejects partial utf8 sequence" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 5,
+            .rows = 2,
+            .max_scrollback = 10_000,
+        },
+    ));
+    defer free(t);
+
+    vt_write(t, "\xF0\x9F\x99", 3);
+
+    var snapshot_ptr: ?[*]u8 = null;
+    var snapshot_len: usize = 0;
+    try testing.expectEqual(Result.invalid_value, snapshot_export(
+        t,
+        &lib.alloc.test_allocator,
+        &snapshot_ptr,
+        &snapshot_len,
+    ));
+
+    vt_write(t, "\x82", 1);
+
+    try testing.expectEqual(Result.success, snapshot_export(
+        t,
+        &lib.alloc.test_allocator,
+        &snapshot_ptr,
+        &snapshot_len,
+    ));
+    defer allocator_c.free(&lib.alloc.test_allocator, snapshot_ptr, snapshot_len);
 }
 
 test "resize" {
@@ -1525,6 +1822,182 @@ test "title_changed without callback is silent" {
 
     // OSC 2 without a callback should not crash
     vt_write(t, "\x1B]2;Hello\x1B\\", 10);
+}
+
+test "set pwd_changed callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    const S = struct {
+        var pwd_count: usize = 0;
+
+        fn pwdChanged(_: Terminal, _: ?*anyopaque) callconv(lib.calling_conv) void {
+            pwd_count += 1;
+        }
+    };
+    S.pwd_count = 0;
+
+    try testing.expectEqual(Result.success, set(t, .pwd_changed, @ptrCast(&S.pwdChanged)));
+
+    const seq = "\x1B]7;file:///tmp/example\x07";
+    vt_write(t, seq, seq.len);
+    try testing.expectEqual(@as(usize, 1), S.pwd_count);
+    try testing.expectEqualStrings("file:///tmp/example", t.?.terminal.getPwd().?);
+}
+
+test "set notification callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    const S = struct {
+        var title: ?[]u8 = null;
+        var body: ?[]u8 = null;
+
+        fn deinit() void {
+            if (title) |value| testing.allocator.free(value);
+            if (body) |value| testing.allocator.free(value);
+            title = null;
+            body = null;
+        }
+
+        fn notification(
+            _: Terminal,
+            _: ?*anyopaque,
+            title_ptr: [*]const u8,
+            title_len: usize,
+            body_ptr: [*]const u8,
+            body_len: usize,
+        ) callconv(lib.calling_conv) void {
+            if (title) |value| testing.allocator.free(value);
+            if (body) |value| testing.allocator.free(value);
+            title = testing.allocator.dupe(u8, title_ptr[0..title_len]) catch @panic("OOM");
+            body = testing.allocator.dupe(u8, body_ptr[0..body_len]) catch @panic("OOM");
+        }
+    };
+    defer S.deinit();
+
+    try testing.expectEqual(Result.success, set(t, .notification, @ptrCast(&S.notification)));
+
+    const seq = "\x1B]9;Hello world\x07";
+    vt_write(t, seq, seq.len);
+    try testing.expect(S.title != null);
+    try testing.expect(S.body != null);
+    try testing.expectEqualStrings("", S.title.?);
+    try testing.expectEqualStrings("Hello world", S.body.?);
+}
+
+test "set semantic_prompt callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_action: ?SemanticPromptAction = null;
+
+        fn semanticPrompt(_: Terminal, _: ?*anyopaque, action: SemanticPromptAction) callconv(lib.calling_conv) void {
+            last_action = action;
+        }
+    };
+    S.last_action = null;
+
+    try testing.expectEqual(Result.success, set(t, .semantic_prompt, @ptrCast(&S.semanticPrompt)));
+
+    const seq = "\x1B]133;A\x07";
+    vt_write(t, seq, seq.len);
+    try testing.expectEqual(@as(?SemanticPromptAction, .fresh_line_new_prompt), S.last_action);
+}
+
+test "set mode_changed callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_mode: ?modes.ModeTag.Backing = null;
+        var last_enabled: bool = false;
+
+        fn modeChanged(
+            _: Terminal,
+            _: ?*anyopaque,
+            mode: modes.ModeTag.Backing,
+            enabled: bool,
+        ) callconv(lib.calling_conv) void {
+            last_mode = mode;
+            last_enabled = enabled;
+        }
+    };
+    S.last_mode = null;
+    S.last_enabled = false;
+
+    try testing.expectEqual(Result.success, set(t, .mode_changed, @ptrCast(&S.modeChanged)));
+
+    const seq = "\x1B[?2004h";
+    vt_write(t, seq, seq.len);
+    try testing.expectEqual(@as(?modes.ModeTag.Backing, @intFromEnum(modes.Mode.bracketed_paste)), S.last_mode);
+    try testing.expect(S.last_enabled);
+}
+
+test "set kitty_keyboard_changed callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    const S = struct {
+        var count: usize = 0;
+
+        fn kittyKeyboardChanged(_: Terminal, _: ?*anyopaque) callconv(lib.calling_conv) void {
+            count += 1;
+        }
+    };
+    S.count = 0;
+
+    try testing.expectEqual(Result.success, set(t, .kitty_keyboard_changed, @ptrCast(&S.kittyKeyboardChanged)));
+
+    const seq = "\x1B[>3u";
+    vt_write(t, seq, seq.len);
+    try testing.expectEqual(@as(usize, 1), S.count);
 }
 
 test "set size callback" {

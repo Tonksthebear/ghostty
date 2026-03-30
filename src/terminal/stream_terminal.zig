@@ -3,6 +3,7 @@ const testing = std.testing;
 const csi = @import("csi.zig");
 const device_attributes = @import("device_attributes.zig");
 const device_status = @import("device_status.zig");
+const osc = @import("osc.zig");
 const stream = @import("stream.zig");
 const Action = stream.Action;
 const Screen = @import("Screen.zig");
@@ -70,6 +71,22 @@ pub const Handler = struct {
         /// handler.terminal.getTitle().
         title_changed: ?*const fn (*Handler) void,
 
+        /// Called when the terminal working directory changes via OSC 7.
+        /// The new pwd can be queried via handler.terminal.getPwd().
+        pwd_changed: ?*const fn (*Handler) void,
+
+        /// Called when an OSC notification is received.
+        notification: ?*const fn (*Handler, []const u8, []const u8) void,
+
+        /// Called when semantic prompt state changes via OSC 133.
+        semantic_prompt: ?*const fn (*Handler, osc.Command.SemanticPrompt.Action) void,
+
+        /// Called when a terminal mode changes via CSI h/l.
+        mode_changed: ?*const fn (*Handler, modes.ModeTag.Backing, bool) void,
+
+        /// Called when the kitty keyboard stack changes.
+        kitty_keyboard_changed: ?*const fn (*Handler) void,
+
         /// Called in response to an XTVERSION query. Returns the version
         /// string to report (e.g. "ghostty 1.2.3"). The returned memory
         /// must be valid for the lifetime of the call. The maximum length
@@ -84,6 +101,11 @@ pub const Handler = struct {
             .color_scheme = null,
             .device_attributes = null,
             .enquiry = null,
+            .kitty_keyboard_changed = null,
+            .mode_changed = null,
+            .notification = null,
+            .pwd_changed = null,
+            .semantic_prompt = null,
             .size = null,
             .title_changed = null,
             .write_pty = null,
@@ -208,11 +230,26 @@ pub const Handler = struct {
             .protected_mode_iso => self.terminal.setProtectedMode(.iso),
             .protected_mode_dec => self.terminal.setProtectedMode(.dec),
             .mouse_shift_capture => self.terminal.flags.mouse_shift_capture = if (value) .true else .false,
-            .kitty_keyboard_push => self.terminal.screens.active.kitty_keyboard.push(value.flags),
-            .kitty_keyboard_pop => self.terminal.screens.active.kitty_keyboard.pop(@intCast(value)),
-            .kitty_keyboard_set => self.terminal.screens.active.kitty_keyboard.set(.set, value.flags),
-            .kitty_keyboard_set_or => self.terminal.screens.active.kitty_keyboard.set(.@"or", value.flags),
-            .kitty_keyboard_set_not => self.terminal.screens.active.kitty_keyboard.set(.not, value.flags),
+            .kitty_keyboard_push => {
+                self.terminal.screens.active.kitty_keyboard.push(value.flags);
+                self.kittyKeyboardChanged();
+            },
+            .kitty_keyboard_pop => {
+                self.terminal.screens.active.kitty_keyboard.pop(@intCast(value));
+                self.kittyKeyboardChanged();
+            },
+            .kitty_keyboard_set => {
+                self.terminal.screens.active.kitty_keyboard.set(.set, value.flags);
+                self.kittyKeyboardChanged();
+            },
+            .kitty_keyboard_set_or => {
+                self.terminal.screens.active.kitty_keyboard.set(.@"or", value.flags);
+                self.kittyKeyboardChanged();
+            },
+            .kitty_keyboard_set_not => {
+                self.terminal.screens.active.kitty_keyboard.set(.not, value.flags);
+                self.kittyKeyboardChanged();
+            },
             .modify_key_format => {
                 self.terminal.flags.modify_other_keys_2 = false;
                 switch (value) {
@@ -225,7 +262,10 @@ pub const Handler = struct {
             .full_reset => self.terminal.fullReset(),
             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
-            .semantic_prompt => try self.terminal.semanticPrompt(value),
+            .semantic_prompt => {
+                try self.terminal.semanticPrompt(value);
+                self.semanticPromptChanged(value.action);
+            },
             .mouse_shape => self.terminal.mouse_shape = value,
             .color_operation => try self.colorOperation(value.op, &value.requests),
             .kitty_color_report => try self.kittyColorOperation(value),
@@ -257,8 +297,8 @@ pub const Handler = struct {
             => {},
 
             // Have no terminal-modifying effect
-            .report_pwd,
-            .show_desktop_notification,
+            .report_pwd => self.reportPwd(value.url),
+            .show_desktop_notification => self.showDesktopNotification(value.title, value.body),
             .progress_report,
             .clipboard_contents,
             .title_push,
@@ -274,6 +314,36 @@ pub const Handler = struct {
 
     fn bell(self: *Handler) void {
         const func = self.effects.bell orelse return;
+        func(self);
+    }
+
+    fn reportPwd(self: *Handler, pwd: []const u8) void {
+        self.terminal.setPwd(pwd) catch |err| {
+            log.warn("error setting pwd err={}", .{err});
+            return;
+        };
+
+        const func = self.effects.pwd_changed orelse return;
+        func(self);
+    }
+
+    fn showDesktopNotification(self: *Handler, title: []const u8, body: []const u8) void {
+        const func = self.effects.notification orelse return;
+        func(self, title, body);
+    }
+
+    fn semanticPromptChanged(self: *Handler, action: osc.Command.SemanticPrompt.Action) void {
+        const func = self.effects.semantic_prompt orelse return;
+        func(self, action);
+    }
+
+    fn modeChanged(self: *Handler, mode: modes.Mode, enabled: bool) void {
+        const func = self.effects.mode_changed orelse return;
+        func(self, @bitCast(modes.ModeTag.fromMode(mode)), enabled);
+    }
+
+    fn kittyKeyboardChanged(self: *Handler) void {
+        const func = self.effects.kitty_keyboard_changed orelse return;
         func(self);
     }
 
@@ -542,6 +612,8 @@ pub const Handler = struct {
 
             else => {},
         }
+
+        self.modeChanged(mode, enabled);
     }
 
     fn colorOperation(

@@ -305,6 +305,44 @@ pub const Page = struct {
         self.* = initBuf(.init(self.memory), layout(self.capacity));
     }
 
+    /// Rebuild derived and out-of-band metadata after loading raw page
+    /// backing memory from a snapshot.
+    pub fn snapshotCanonicalize(self: *Page) error{InvalidSnapshot}!void {
+        self.styles.rebuild(self.memory) catch return error.InvalidSnapshot;
+        self.hyperlink_set.rebuildContext(
+            self.memory,
+            .{ .page = self },
+        ) catch return error.InvalidSnapshot;
+
+        const rows = self.rows.ptr(self.memory);
+        for (rows[0..self.capacity.rows], 0..) |*row, y| {
+            var row_styled = false;
+            var row_hyperlink = false;
+            var row_grapheme = false;
+            var row_kitty_virtual_placeholder = false;
+
+            if (y < self.size.rows) {
+                const cells = row.cells.ptr(self.memory)[0..self.size.cols];
+                for (cells) |cell| {
+                    row_styled = row_styled or cell.style_id != stylepkg.default_id;
+                    row_hyperlink = row_hyperlink or cell.hyperlink;
+                    row_grapheme = row_grapheme or cell.hasGrapheme();
+
+                    if (comptime build_options.kitty_graphics) {
+                        row_kitty_virtual_placeholder = row_kitty_virtual_placeholder or
+                            cell.content_tag == .codepoint and
+                                cell.content.codepoint == kitty.graphics.unicode.placeholder;
+                    }
+                }
+            }
+
+            row.styled = row_styled;
+            row.hyperlink = row_hyperlink;
+            row.grapheme = row_grapheme;
+            row.kitty_virtual_placeholder = row_kitty_virtual_placeholder;
+        }
+    }
+
     pub const IntegrityError = error{
         ZeroRowCount,
         ZeroColCount,
@@ -1341,7 +1379,7 @@ pub const Page = struct {
 
             break :uri .{
                 .offset = size.getOffset(u8, self.memory, &buf[0]),
-                .len = link.uri.len,
+                .len = @intCast(link.uri.len),
             };
         };
         errdefer self.string_alloc.free(
@@ -1365,7 +1403,7 @@ pub const Page = struct {
                 break :explicit .{
                     .explicit = .{
                         .offset = size.getOffset(u8, self.memory, &buf[0]),
-                        .len = id.len,
+                        .len = @intCast(id.len),
                     },
                 };
             },
@@ -1507,7 +1545,7 @@ pub const Page = struct {
 
         map.putNoClobber(cell_offset, .{
             .offset = getOffset(u21, self.memory, @ptrCast(slice.ptr)),
-            .len = slice.len,
+            .len = @intCast(slice.len),
         }) catch |e| {
             comptime assert(@TypeOf(e) == error{OutOfMemory});
             // The grapheme map capacity needs to be increased.

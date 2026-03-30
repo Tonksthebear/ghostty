@@ -70,6 +70,11 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_WRITE_PTY`        | `GhosttyTerminalWritePtyFn`       | Query responses written back to the pty   |
  * | `GHOSTTY_TERMINAL_OPT_BELL`             | `GhosttyTerminalBellFn`           | BEL character (0x07)                      |
  * | `GHOSTTY_TERMINAL_OPT_TITLE_CHANGED`    | `GhosttyTerminalTitleChangedFn`   | Title change via OSC 0 / OSC 2            |
+ * | `GHOSTTY_TERMINAL_OPT_PWD_CHANGED`      | `GhosttyTerminalPwdChangedFn`     | Working directory change via OSC 7        |
+ * | `GHOSTTY_TERMINAL_OPT_NOTIFICATION`     | `GhosttyTerminalNotificationFn`   | Desktop notification via OSC 9 / OSC 777  |
+ * | `GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT`  | `GhosttyTerminalSemanticPromptChangedFn` | Semantic prompt update via OSC 133 |
+ * | `GHOSTTY_TERMINAL_OPT_MODE_CHANGED`     | `GhosttyTerminalModeChangedFn`    | VT mode change via CSI h/l                |
+ * | `GHOSTTY_TERMINAL_OPT_KITTY_KEYBOARD_CHANGED` | `GhosttyTerminalKittyKeyboardChangedFn` | Kitty keyboard protocol change      |
  * | `GHOSTTY_TERMINAL_OPT_ENQUIRY`          | `GhosttyTerminalEnquiryFn`        | ENQ character (0x05)                      |
  * | `GHOSTTY_TERMINAL_OPT_XTVERSION`        | `GhosttyTerminalXtversionFn`      | XTVERSION query (CSI > q)                 |
  * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS size query (CSI 14/16/18 t)      |
@@ -250,6 +255,22 @@ typedef struct {
 } GhosttyTerminalScrollbar;
 
 /**
+ * Semantic prompt action reported by OSC 133.
+ *
+ * @ingroup terminal
+ */
+typedef enum {
+  GHOSTTY_SEMANTIC_PROMPT_FRESH_LINE = 0,
+  GHOSTTY_SEMANTIC_PROMPT_FRESH_LINE_NEW_PROMPT = 1,
+  GHOSTTY_SEMANTIC_PROMPT_NEW_COMMAND = 2,
+  GHOSTTY_SEMANTIC_PROMPT_PROMPT_START = 3,
+  GHOSTTY_SEMANTIC_PROMPT_END_PROMPT_START_INPUT = 4,
+  GHOSTTY_SEMANTIC_PROMPT_END_PROMPT_START_INPUT_TERMINATE_EOL = 5,
+  GHOSTTY_SEMANTIC_PROMPT_END_INPUT_START_OUTPUT = 6,
+  GHOSTTY_SEMANTIC_PROMPT_END_COMMAND = 7,
+} GhosttySemanticPromptAction;
+
+/**
  * Callback function type for bell.
  *
  * Called when the terminal receives a BEL character (0x07).
@@ -350,6 +371,90 @@ typedef bool (*GhosttyTerminalSizeFn)(GhosttyTerminal terminal,
  */
 typedef void (*GhosttyTerminalTitleChangedFn)(GhosttyTerminal terminal,
                                               void* userdata);
+
+/**
+ * Callback function type for pwd_changed.
+ *
+ * Called when the terminal working directory changes via OSC 7.
+ * The new pwd can be queried from the terminal after the callback returns.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalPwdChangedFn)(GhosttyTerminal terminal,
+                                            void* userdata);
+
+/**
+ * Callback function type for desktop notifications.
+ *
+ * Called when the terminal receives a desktop notification request via
+ * OSC 9 or OSC 777. The title and body pointers are only valid for the
+ * duration of the callback. Use the corresponding length values; either
+ * field may be empty.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param title Pointer to the notification title bytes
+ * @param title_len Length of the title in bytes
+ * @param body Pointer to the notification body bytes
+ * @param body_len Length of the body in bytes
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalNotificationFn)(GhosttyTerminal terminal,
+                                              void* userdata,
+                                              const uint8_t* title,
+                                              size_t title_len,
+                                              const uint8_t* body,
+                                              size_t body_len);
+
+/**
+ * Callback function type for semantic prompt changes.
+ *
+ * Called when VT processing updates semantic prompt state via OSC 133.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param action The semantic prompt action that was processed
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalSemanticPromptChangedFn)(GhosttyTerminal terminal,
+                                                       void* userdata,
+                                                       GhosttySemanticPromptAction action);
+
+/**
+ * Callback function type for terminal mode changes.
+ *
+ * Called when VT processing changes a terminal mode via the stream,
+ * such as CSI h/l mode sequences.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param mode The mode that changed
+ * @param enabled true if the mode is now set, false if it is reset
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalModeChangedFn)(GhosttyTerminal terminal,
+                                             void* userdata,
+                                             GhosttyMode mode,
+                                             bool enabled);
+
+/**
+ * Callback function type for kitty keyboard changes.
+ *
+ * Called when VT processing changes the kitty keyboard protocol state.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalKittyKeyboardChangedFn)(GhosttyTerminal terminal,
+                                                      void* userdata);
 
 /**
  * Callback function type for write_pty.
@@ -530,6 +635,46 @@ typedef enum {
    * Input type: GhosttyColorRgb[256]*
    */
   GHOSTTY_TERMINAL_OPT_COLOR_PALETTE = 14,
+
+  /**
+   * Callback invoked when VT processing changes the terminal working
+   * directory via OSC 7. Set to NULL to ignore pwd change events.
+   *
+   * Input type: GhosttyTerminalPwdChangedFn
+   */
+  GHOSTTY_TERMINAL_OPT_PWD_CHANGED = 15,
+
+  /**
+   * Callback invoked when VT processing receives a desktop notification
+   * request via OSC 9 or OSC 777. Set to NULL to ignore notifications.
+   *
+   * Input type: GhosttyTerminalNotificationFn
+   */
+  GHOSTTY_TERMINAL_OPT_NOTIFICATION = 16,
+
+  /**
+   * Callback invoked when VT processing updates semantic prompt state
+   * via OSC 133. Set to NULL to ignore semantic prompt events.
+   *
+   * Input type: GhosttyTerminalSemanticPromptChangedFn
+   */
+  GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT = 17,
+
+  /**
+   * Callback invoked when VT processing changes a terminal mode via
+   * the stream. Set to NULL to ignore mode change events.
+   *
+   * Input type: GhosttyTerminalModeChangedFn
+   */
+  GHOSTTY_TERMINAL_OPT_MODE_CHANGED = 18,
+
+  /**
+   * Callback invoked when VT processing changes kitty keyboard protocol
+   * state. Set to NULL to ignore kitty keyboard change events.
+   *
+   * Input type: GhosttyTerminalKittyKeyboardChangedFn
+   */
+  GHOSTTY_TERMINAL_OPT_KITTY_KEYBOARD_CHANGED = 19,
 } GhosttyTerminalOption;
 
 /**
@@ -969,6 +1114,45 @@ GhosttyResult ghostty_terminal_get(GhosttyTerminal terminal,
 GhosttyResult ghostty_terminal_grid_ref(GhosttyTerminal terminal,
                                         GhosttyPoint point,
                                         GhosttyGridRef *out_ref);
+
+/**
+ * Export the full terminal state into an opaque binary snapshot.
+ *
+ * The returned buffer is allocated with the provided allocator, or the
+ * default allocator if NULL is passed. Free it with ghostty_free() using
+ * the same allocator. Export only succeeds when the terminal's VT stream
+ * is at a parser boundary; partial UTF-8 or partial escape sequences
+ * return GHOSTTY_INVALID_VALUE.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param allocator Pointer to allocator, or NULL to use the default allocator
+ * @param[out] out_ptr On success, set to the allocated snapshot buffer
+ * @param[out] out_len On success, set to the snapshot length in bytes
+ * @return GHOSTTY_SUCCESS on success, or an error code on failure
+ *
+ * @ingroup terminal
+ */
+GhosttyResult ghostty_terminal_snapshot_export(GhosttyTerminal terminal,
+                                               const GhosttyAllocator* allocator,
+                                               uint8_t** out_ptr,
+                                               size_t* out_len);
+
+/**
+ * Import a previously exported terminal snapshot.
+ *
+ * On success, the destination terminal is replaced with the imported
+ * state atomically and its VT stream parser state is reset.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param ptr Pointer to snapshot bytes
+ * @param len Length of the snapshot in bytes
+ * @return GHOSTTY_SUCCESS on success, or an error code on failure
+ *
+ * @ingroup terminal
+ */
+GhosttyResult ghostty_terminal_snapshot_import(GhosttyTerminal terminal,
+                                               const uint8_t* ptr,
+                                               size_t len);
 
 /** @} */
 

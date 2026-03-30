@@ -752,6 +752,97 @@ pub fn reset(self: *PageList) void {
     self.viewport = .active;
 }
 
+pub const SnapshotReplaceError = Allocator.Error || error{
+    InvalidSnapshot,
+};
+
+pub const SnapshotPage = struct {
+    capacity: Capacity,
+    size: pagepkg.Size,
+    dirty: bool,
+    memory: []const u8,
+};
+
+/// Replace all pages with snapshot data.
+///
+/// This preserves the tracked pin allocation objects but remaps them to the
+/// first page top-left. Callers are responsible for restoring cursor or other
+/// tracked pins to their desired locations afterwards.
+pub fn snapshotReplace(
+    self: *PageList,
+    pages_data: []const SnapshotPage,
+) SnapshotReplaceError!void {
+    defer self.assertIntegrity();
+
+    if (pages_data.len == 0) return error.InvalidSnapshot;
+
+    var new_pages: List = .{};
+    errdefer {
+        var it = new_pages.first;
+        while (it) |node| {
+            const next = node.next;
+            self.destroyNode(node);
+            it = next;
+        }
+    }
+
+    var total_rows: usize = 0;
+    for (pages_data) |page_data| {
+        if (page_data.size.cols == 0 or page_data.size.rows == 0) {
+            return error.InvalidSnapshot;
+        }
+        if (page_data.size.cols > page_data.capacity.cols or
+            page_data.size.rows > page_data.capacity.rows)
+        {
+            return error.InvalidSnapshot;
+        }
+
+        const layout = Page.layout(page_data.capacity);
+        if (layout.total_size != page_data.memory.len) return error.InvalidSnapshot;
+
+        const node = try self.createPage(page_data.capacity);
+        errdefer self.destroyNode(node);
+
+        @memcpy(node.data.memory, page_data.memory);
+        node.data.size = page_data.size;
+        node.data.dirty = page_data.dirty;
+        try node.data.snapshotCanonicalize();
+        new_pages.append(node);
+
+        total_rows = std.math.add(usize, total_rows, @as(usize, page_data.size.rows)) catch
+            return error.InvalidSnapshot;
+    }
+
+    if (total_rows < @as(usize, self.rows)) return error.InvalidSnapshot;
+
+    {
+        var it = self.pages.first;
+        while (it) |node| {
+            const next = node.next;
+            self.destroyNode(node);
+            it = next;
+        }
+    }
+
+    self.pages = new_pages;
+    self.total_rows = total_rows;
+    self.page_serial_min = 0;
+    self.viewport = .active;
+    self.viewport_pin_row_offset = null;
+
+    {
+        var it = self.tracked_pins.iterator();
+        while (it.next()) |entry| {
+            const p: *Pin = entry.key_ptr.*;
+            p.node = self.pages.first.?;
+            p.x = 0;
+            p.y = 0;
+            p.garbage = true;
+        }
+        self.viewport_pin.garbage = false;
+    }
+}
+
 pub const Clone = struct {
     /// The top and bottom (inclusive) points of the region to clone.
     /// The x coordinate is ignored; the full row is always cloned.

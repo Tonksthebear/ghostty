@@ -50,7 +50,7 @@ pub fn Offset(comptime T: type) type {
         /// A slice of type T that stores via a base offset and len.
         pub const Slice = struct {
             offset: Self = .{},
-            len: usize = 0,
+            len: OffsetInt = 0,
 
             /// Returns a slice for the data, properly typed.
             pub inline fn slice(self: Slice, base: anytype) []T {

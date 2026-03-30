@@ -219,6 +219,63 @@ pub fn RefCountedSet(
             };
         }
 
+        pub const RebuildError = error{Corrupt};
+
+        /// Rebuild the bookkeeping fields that live outside the backing
+        /// memory from the serialized table/items contents.
+        pub fn rebuild(self: *Self, base: anytype) RebuildError!void {
+            return self.rebuildContext(base, self.context);
+        }
+        pub fn rebuildContext(self: *Self, base: anytype, ctx: Context) RebuildError!void {
+            self.max_psl = 0;
+            self.psl_stats = @splat(0);
+            self.living = 0;
+            self.next_id = 1;
+
+            if (self.layout.cap == 0) return;
+
+            const table = self.table.ptr(base)[0..self.layout.table_cap];
+            const items = self.items.ptr(base)[0..self.layout.cap];
+
+            var max_id: usize = 0;
+
+            for (table, 0..) |id, bucket| {
+                if (id == 0) continue;
+
+                const id_usize: usize = @intCast(id);
+                if (id_usize >= self.layout.cap) return error.Corrupt;
+
+                const item = &items[id_usize];
+                if (item.meta.bucket != @as(Id, @intCast(bucket))) return error.Corrupt;
+                if (item.meta.psl >= self.psl_stats.len) return error.Corrupt;
+
+                const hash: u64 = ctx.hash(item.value);
+                const expected_bucket: usize = @intCast(
+                    (hash +% item.meta.psl) & self.layout.table_mask,
+                );
+                if (expected_bucket != bucket) return error.Corrupt;
+
+                self.psl_stats[item.meta.psl] += 1;
+                self.max_psl = @max(self.max_psl, item.meta.psl);
+                if (item.meta.ref > 0) self.living += 1;
+                max_id = @max(max_id, id_usize);
+            }
+
+            for (items[1..], 1..) |item, id_usize| {
+                const in_table = item.meta.bucket < self.layout.table_cap;
+                if (in_table) {
+                    if (table[item.meta.bucket] != @as(Id, @intCast(id_usize))) {
+                        return error.Corrupt;
+                    }
+                    max_id = @max(max_id, id_usize);
+                } else if (item.meta.ref != 0 or item.meta.psl != 0) {
+                    return error.Corrupt;
+                }
+            }
+
+            self.next_id = std.math.cast(Id, max_id + 1) orelse std.math.maxInt(Id);
+        }
+
         /// Possible errors for `add` and `addWithId`.
         pub const AddError = error{
             /// There is not enough memory to add a new item.

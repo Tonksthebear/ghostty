@@ -22,6 +22,7 @@ pub fn addInstrumentedExe(
         b.findProgram(&.{"afl-cc"}, &.{}) catch
             @panic("Could not find 'afl-cc', which is required to build"),
         "-O3",
+        "-Wl,-ld_classic",
     });
     afl_cc.addArg("-o");
     const fuzz_exe = afl_cc.addOutputFileArg(obj.name);

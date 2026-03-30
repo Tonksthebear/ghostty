@@ -140,6 +140,8 @@ pub const terminal_mode_get = terminal.mode_get;
 pub const terminal_mode_set = terminal.mode_set;
 pub const terminal_get = terminal.get;
 pub const terminal_grid_ref = terminal.grid_ref;
+pub const terminal_snapshot_export = terminal.snapshot_export;
+pub const terminal_snapshot_import = terminal.snapshot_import;
 
 const grid_ref = @import("grid_ref.zig");
 pub const grid_ref_cell = grid_ref.grid_ref_cell;

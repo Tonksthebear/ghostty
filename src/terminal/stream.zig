@@ -467,6 +467,12 @@ pub fn Stream(comptime H: type) type {
             self.handler.deinit();
         }
 
+        /// Returns true when the stream is at a parser boundary and has no
+        /// buffered partial UTF-8 or control-sequence state.
+        pub fn isIdle(self: *const Self) bool {
+            return self.parser.state == .ground and self.utf8decoder.state == 0;
+        }
+
         /// Process a string of characters.
         pub inline fn nextSlice(self: *Self, input: []const u8) void {
             // Disable SIMD optimizations if build requests it or if our
