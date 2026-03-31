@@ -91,13 +91,13 @@ pub fn exportAlloc(t: *const Terminal, alloc: Allocator) Error![]u8 {
     try appendColors(&out, alloc, t.colors);
     try appendTabstops(&out, alloc, t.tabstops);
     try appendOptionalCodepoint(&out, alloc, t.previous_char);
-    try appendInt(&out, alloc, u8, @intFromEnum(t.status_display));
+    try appendInt(&out, alloc, u8, @intCast(@intFromEnum(t.status_display)));
     try appendInt(&out, alloc, i32, @intFromEnum(t.mouse_shape));
-    try appendInt(&out, alloc, u8, @intFromEnum(t.flags.shell_redraws_prompt));
+    try appendInt(&out, alloc, u8, @intCast(@intFromEnum(t.flags.shell_redraws_prompt)));
     try appendBool(&out, alloc, t.flags.modify_other_keys_2);
-    try appendInt(&out, alloc, u8, @intFromEnum(t.flags.mouse_event));
-    try appendInt(&out, alloc, u8, @intFromEnum(t.flags.mouse_format));
-    try appendInt(&out, alloc, u8, @intFromEnum(t.flags.mouse_shift_capture));
+    try appendInt(&out, alloc, u8, @intCast(@intFromEnum(t.flags.mouse_event)));
+    try appendInt(&out, alloc, u8, @intCast(@intFromEnum(t.flags.mouse_format)));
+    try appendInt(&out, alloc, u8, @intCast(@intFromEnum(t.flags.mouse_shift_capture)));
     try appendString(&out, alloc, t.getPwd() orelse "");
     try appendString(&out, alloc, t.getTitle() orelse "");
 
@@ -233,18 +233,18 @@ fn exportScreenBlob(
 
     try appendInt(&blob, alloc, u16, screen.cursor.x);
     try appendInt(&blob, alloc, u16, screen.cursor.y);
-    try appendInt(&blob, alloc, u8, @intFromEnum(screen.cursor.cursor_style));
+    try appendInt(&blob, alloc, u8, @intCast(@intFromEnum(screen.cursor.cursor_style)));
     try appendBool(&blob, alloc, screen.cursor.pending_wrap);
     try appendBool(&blob, alloc, screen.cursor.protected);
     try appendStyle(&blob, alloc, screen.cursor.style);
     try appendInt(&blob, alloc, stylepkg.Id, screen.cursor.style_id);
-    try appendInt(&blob, alloc, u8, @intFromEnum(screen.cursor.semantic_content));
+    try appendInt(&blob, alloc, u8, @intCast(@intFromEnum(screen.cursor.semantic_content)));
     try appendBool(&blob, alloc, screen.cursor.semantic_content_clear_eol);
     try appendInt(&blob, alloc, u32, screen.cursor.hyperlink_implicit_id);
     try appendInt(&blob, alloc, hyperlink.Id, screen.cursor.hyperlink_id);
     try appendSavedCursor(&blob, alloc, screen.saved_cursor);
     try appendCharsetState(&blob, alloc, screen.charset);
-    try appendInt(&blob, alloc, u8, @intFromEnum(screen.protected_mode));
+    try appendInt(&blob, alloc, u8, @intCast(@intFromEnum(screen.protected_mode)));
     try appendKeyFlagStack(&blob, alloc, screen.kitty_keyboard);
     try appendBool(&blob, alloc, screen.semantic_prompt.seen);
     try appendSemanticClick(&blob, alloc, screen.semantic_prompt.click);
@@ -434,14 +434,14 @@ fn appendCharsetState(
     alloc: Allocator,
     charset: Screen.CharsetState,
 ) Error!void {
-    try appendInt(out, alloc, u8, @intFromEnum(charset.charsets.g0));
-    try appendInt(out, alloc, u8, @intFromEnum(charset.charsets.g1));
-    try appendInt(out, alloc, u8, @intFromEnum(charset.charsets.g2));
-    try appendInt(out, alloc, u8, @intFromEnum(charset.charsets.g3));
-    try appendInt(out, alloc, u8, @intFromEnum(charset.gl));
-    try appendInt(out, alloc, u8, @intFromEnum(charset.gr));
+    try appendInt(out, alloc, u8, @intCast(@intFromEnum(charset.charsets.g0)));
+    try appendInt(out, alloc, u8, @intCast(@intFromEnum(charset.charsets.g1)));
+    try appendInt(out, alloc, u8, @intCast(@intFromEnum(charset.charsets.g2)));
+    try appendInt(out, alloc, u8, @intCast(@intFromEnum(charset.charsets.g3)));
+    try appendInt(out, alloc, u8, @intCast(@intFromEnum(charset.gl)));
+    try appendInt(out, alloc, u8, @intCast(@intFromEnum(charset.gr)));
     try appendBool(out, alloc, charset.single_shift != null);
-    if (charset.single_shift) |slot| try appendInt(out, alloc, u8, @intFromEnum(slot));
+    if (charset.single_shift) |slot| try appendInt(out, alloc, u8, @intCast(@intFromEnum(slot)));
 }
 
 fn readCharsetState(reader: *Reader) Error!Screen.CharsetState {
@@ -489,7 +489,7 @@ fn appendSemanticClick(
         .click_events => try appendInt(out, alloc, u8, 1),
         .cl => |v| {
             try appendInt(out, alloc, u8, 2);
-            try appendInt(out, alloc, u8, @intFromEnum(v));
+            try appendInt(out, alloc, u8, @intCast(@intFromEnum(v)));
         },
     }
 }
