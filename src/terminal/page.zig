@@ -1718,6 +1718,10 @@ pub const Page = struct {
 
     pub const Layout = struct {
         total_size: usize,
+        /// The size of meaningful content before page-size alignment.
+        /// This is platform-independent (unlike total_size which is
+        /// aligned to std.heap.page_size_min, a platform-dependent value).
+        content_size: usize,
         rows_start: usize,
         rows_size: usize,
         cells_start: usize,
@@ -1792,6 +1796,7 @@ pub const Page = struct {
 
         return .{
             .total_size = total_size,
+            .content_size = hyperlink_map_end,
             .rows_start = rows_start,
             .rows_size = rows_end - rows_start,
             .cells_start = cells_start,

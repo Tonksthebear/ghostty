@@ -798,12 +798,25 @@ pub fn snapshotReplace(
         }
 
         const layout = Page.layout(page_data.capacity);
-        if (layout.total_size != page_data.memory.len) return error.InvalidSnapshot;
+
+        // Validate that the source memory contains all meaningful content.
+        // We compare against content_size (pre-page-alignment) rather than
+        // total_size because total_size includes padding aligned to
+        // std.heap.page_size_min, which varies across platforms (e.g.
+        // 16KB on arm64 macOS vs 64KB on wasm32). The content layout
+        // before that final alignment is identical for a given capacity.
+        if (page_data.memory.len < layout.content_size) return error.InvalidSnapshot;
 
         const node = try self.createPage(page_data.capacity);
         errdefer self.destroyNode(node);
 
-        @memcpy(node.data.memory, page_data.memory);
+        // Copy the meaningful content. The destination page (allocated
+        // with the local platform's total_size) may be larger or smaller
+        // than the source due to different page alignment. Both are >=
+        // content_size, so we copy the overlapping region. Any remaining
+        // bytes in the destination are already zeroed by the OS (mmap).
+        const copy_len = @min(page_data.memory.len, layout.total_size);
+        @memcpy(node.data.memory[0..copy_len], page_data.memory[0..copy_len]);
         node.data.size = page_data.size;
         node.data.dirty = page_data.dirty;
         try node.data.snapshotCanonicalize();
@@ -14695,4 +14708,139 @@ test "PageList split preserves hyperlinks" {
         const link = second_page.hyperlink_set.get(second_page.memory, link_id);
         try testing.expectEqualStrings("https://example.com", link.uri.slice(second_page.memory));
     }
+}
+
+test "snapshotReplace accepts larger foreign page alignment" {
+    // Regression test: wasm32 (page_size_min=64KB) exports a snapshot, arm64
+    // macOS (page_size_min=16KB) imports it. The wasm32 total_size is
+    // alignForward(content_size, 65536), which may exceed the arm64 total_size
+    // of alignForward(content_size, 16384). The old exact-match check rejected
+    // this; the fix accepts any blob where content_size <= len <= max_foreign.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+    const cap = page.capacity;
+    const page_layout = Page.layout(cap);
+
+    // Compute what wasm32 (64KB pages) would produce for this capacity.
+    const wasm32_total = std.mem.alignForward(usize, page_layout.content_size, 65536);
+
+    // Skip if the sizes happen to match (test would be vacuous).
+    if (wasm32_total == page_layout.total_size) return;
+
+    const foreign_mem = try alloc.alloc(u8, wasm32_total);
+    defer alloc.free(foreign_mem);
+    @memset(foreign_mem, 0);
+    @memcpy(foreign_mem[0..page.memory.len], page.memory);
+
+    const snapshot_pages = [_]SnapshotPage{.{
+        .capacity = cap,
+        .size = page.size,
+        .dirty = false,
+        .memory = foreign_mem,
+    }};
+
+    try s.snapshotReplace(&snapshot_pages);
+}
+
+test "snapshotReplace accepts smaller foreign page alignment" {
+    // The exact production scenario: arm64 macOS (16KB pages) exports a
+    // snapshot, wasm32 (64KB pages) imports it. The arm64 blob is smaller
+    // than wasm32's local total_size but contains all meaningful content.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+    const cap = page.capacity;
+    const page_layout = Page.layout(cap);
+
+    // Compute what arm64 (16KB pages) would produce for this capacity.
+    const arm64_total = std.mem.alignForward(usize, page_layout.content_size, 16384);
+
+    // Skip if the sizes happen to match (test would be vacuous).
+    if (arm64_total == page_layout.total_size) return;
+
+    const foreign_mem = try alloc.alloc(u8, arm64_total);
+    defer alloc.free(foreign_mem);
+    @memset(foreign_mem, 0);
+
+    // Copy only what fits — arm64_total may be smaller than local memory.
+    const copy_len = @min(page.memory.len, arm64_total);
+    @memcpy(foreign_mem[0..copy_len], page.memory[0..copy_len]);
+
+    const snapshot_pages = [_]SnapshotPage{.{
+        .capacity = cap,
+        .size = page.size,
+        .dirty = false,
+        .memory = foreign_mem,
+    }};
+
+    try s.snapshotReplace(&snapshot_pages);
+}
+
+test "snapshotReplace accepts content-size-only blob" {
+    // Minimal valid blob: exactly content_size bytes, no platform padding
+    // at all. This proves the fix accepts any blob >= content_size.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+    const cap = page.capacity;
+    const page_layout = Page.layout(cap);
+
+    const foreign_mem = try alloc.alloc(u8, page_layout.content_size);
+    defer alloc.free(foreign_mem);
+    @memset(foreign_mem, 0);
+
+    const copy_len = @min(page.memory.len, page_layout.content_size);
+    @memcpy(foreign_mem[0..copy_len], page.memory[0..copy_len]);
+
+    const snapshot_pages = [_]SnapshotPage{.{
+        .capacity = cap,
+        .size = page.size,
+        .dirty = false,
+        .memory = foreign_mem,
+    }};
+
+    try s.snapshotReplace(&snapshot_pages);
+}
+
+test "snapshotReplace rejects blob smaller than content size" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+    const cap = page.capacity;
+    const page_layout = Page.layout(cap);
+
+    // One byte short of the minimum valid size.
+    if (page_layout.content_size == 0) return;
+    const undersized = page_layout.content_size - 1;
+
+    const foreign_mem = try alloc.alloc(u8, undersized);
+    defer alloc.free(foreign_mem);
+    @memset(foreign_mem, 0);
+    @memcpy(foreign_mem[0..undersized], page.memory[0..undersized]);
+
+    const snapshot_pages = [_]SnapshotPage{.{
+        .capacity = cap,
+        .size = page.size,
+        .dirty = false,
+        .memory = foreign_mem,
+    }};
+
+    try testing.expectError(error.InvalidSnapshot, s.snapshotReplace(&snapshot_pages));
 }
