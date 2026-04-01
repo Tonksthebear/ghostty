@@ -243,6 +243,38 @@ comptime {
     }
 }
 
+// ── Host log callback ─────────────────────────────────────────────────────
+//
+// Runtime function pointer for routing Zig logs to the host application.
+// Set via ghostty_vt_set_log_callback() before any terminal operations.
+// level: 0=err, 1=warn, 2=info, 3=debug
+
+const LogCallbackFn = *const fn (level: u8, ptr: [*]const u8, len: usize) callconv(.c) void;
+var log_callback: ?LogCallbackFn = null;
+
+fn hostLog(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.EnumLiteral),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const cb = log_callback orelse return;
+    const level_u8: u8 = switch (level) {
+        .err => 0,
+        .warn => 1,
+        .info => 2,
+        .debug => 3,
+    };
+    const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
+    var buf: [2048]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, scope_prefix ++ format, args) catch return;
+    cb(level_u8, msg.ptr, msg.len);
+}
+
+export fn ghostty_vt_set_log_callback(cb: ?LogCallbackFn) void {
+    log_callback = cb;
+}
+
 pub const std_options: std.Options = options: {
     if (builtin.target.cpu.arch.isWasm()) break :options .{
         // Wasm builds we specifically want to optimize for space with small
@@ -257,10 +289,12 @@ pub const std_options: std.Options = options: {
         .logFn = @import("os/wasm/log.zig").log,
     };
 
-    // For everything else we currently use defaults. Longer term I'm
-    // SURE this isn't right (e.g. we definitely want to customize the log
-    // function for the C lib at least).
-    break :options .{};
+    // C library build: route logs through a runtime callback set by
+    // the host application (e.g. Rust's `log` crate) instead of
+    // writing to stderr which would corrupt the TUI.
+    break :options .{
+        .logFn = hostLog,
+    };
 };
 
 test {
