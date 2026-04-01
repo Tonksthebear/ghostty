@@ -276,6 +276,87 @@ pub fn RefCountedSet(
             self.next_id = std.math.cast(Id, max_id + 1) orelse std.math.maxInt(Id);
         }
 
+        /// Rehash the table from scratch using the items array as the source
+        /// of truth. This is necessary when importing data from a different
+        /// platform where hash values differ (e.g. autoHashStrat hashes
+        /// slice lengths as usize, which is 8 bytes on arm64 vs 4 on wasm32).
+        pub fn rehash(self: *Self, base: anytype) void {
+            return self.rehashContext(base, self.context);
+        }
+        pub fn rehashContext(self: *Self, base: anytype, ctx: Context) void {
+            self.max_psl = 0;
+            self.psl_stats = @splat(0);
+            self.living = 0;
+            self.next_id = 1;
+
+            if (self.layout.cap == 0) return;
+
+            const table = self.table.ptr(base)[0..self.layout.table_cap];
+            const items = self.items.ptr(base)[0..self.layout.cap];
+
+            // Clear the hash table — we'll reinsert everything.
+            @memset(table, 0);
+
+            var max_id: usize = 0;
+
+            // Walk all items (slot 0 is reserved/unused) and reinsert
+            // living ones into the hash table with locally-computed hashes.
+            for (items[1..], 1..) |*item, id_usize| {
+                const id: Id = @intCast(id_usize);
+                if (item.meta.ref == 0) {
+                    // Dead item — clear its metadata.
+                    item.meta.psl = 0;
+                    item.meta.bucket = 0;
+                    continue;
+                }
+
+                self.living += 1;
+                max_id = @max(max_id, id_usize);
+
+                // Robin Hood insertion with the local hash.
+                const hash_val: u64 = ctx.hash(item.value);
+                var psl: @TypeOf(item.meta.psl) = 0;
+                var held_id: Id = id;
+                var held_item: *Item = item;
+
+                for (0..self.layout.table_cap) |i| {
+                    _ = i;
+                    const p: Id = @intCast((hash_val +% psl) & self.layout.table_mask);
+                    const existing_id = table[p];
+
+                    if (existing_id == 0) {
+                        // Empty slot — place our item here.
+                        table[p] = held_id;
+                        held_item.meta.bucket = p;
+                        held_item.meta.psl = psl;
+                        self.psl_stats[psl] += 1;
+                        self.max_psl = @max(self.max_psl, psl);
+                        break;
+                    }
+
+                    const existing = &items[existing_id];
+                    if (existing.meta.psl < psl) {
+                        // Robin Hood: steal this bucket from the richer item.
+                        table[p] = held_id;
+                        held_item.meta.bucket = p;
+                        held_item.meta.psl = psl;
+                        self.psl_stats[psl] += 1;
+                        self.max_psl = @max(self.max_psl, psl);
+
+                        // The displaced item becomes our new held item.
+                        held_id = existing_id;
+                        held_item = existing;
+                        self.psl_stats[existing.meta.psl] -= 1;
+                        psl = existing.meta.psl + 1;
+                    } else {
+                        psl += 1;
+                    }
+                }
+            }
+
+            self.next_id = std.math.cast(Id, max_id + 1) orelse std.math.maxInt(Id);
+        }
+
         /// Possible errors for `add` and `addWithId`.
         pub const AddError = error{
             /// There is not enough memory to add a new item.

@@ -308,11 +308,18 @@ pub const Page = struct {
     /// Rebuild derived and out-of-band metadata after loading raw page
     /// backing memory from a snapshot.
     pub fn snapshotCanonicalize(self: *Page) error{InvalidSnapshot}!void {
-        self.styles.rebuild(self.memory) catch return error.InvalidSnapshot;
+        // Try to validate the existing hash tables first (same-platform case).
+        // If validation fails, rehash from scratch — this handles cross-platform
+        // imports where autoHashStrat(.Deep) produces different hashes because
+        // it feeds slice lengths as usize (8 bytes on arm64, 4 on wasm32).
+        self.styles.rebuild(self.memory) catch self.styles.rehash(self.memory);
         self.hyperlink_set.rebuildContext(
             self.memory,
             .{ .page = self },
-        ) catch return error.InvalidSnapshot;
+        ) catch self.hyperlink_set.rehashContext(
+            self.memory,
+            .{ .page = self },
+        );
 
         const rows = self.rows.ptr(self.memory);
         for (rows[0..self.capacity.rows], 0..) |*row, y| {
