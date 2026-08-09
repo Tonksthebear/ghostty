@@ -617,28 +617,21 @@ pub fn increaseCapacity(
     const new_page: *Page = new_node.page();
 
     // Re-add the style, if the page somehow doesn't have enough
-    // memory to add it, we emit a warning and gracefully degrade
-    // to the default style for the cursor.
+    // memory to add it, gracefully degrade to the default style.
+    // Do not log: under page pressure lib-vt emitLog can EXC_BAD_ACCESS
+    // (Botster).
     if (self.cursor.style_id != style.default_id) {
         self.cursor.style_id = new_page.styles.add(
             new_page.memory,
             self.cursor.style,
-        ) catch |err| id: {
-            // TODO: Should we increase the capacity further in this case?
-            log.warn(
-                "(Screen.increaseCapacity) Failed to add cursor style back to page, err={}",
-                .{err},
-            );
-
-            // Reset the cursor style.
+        ) catch style.default_id;
+        if (self.cursor.style_id == style.default_id) {
             self.cursor.style = .{};
-            break :id style.default_id;
-        };
+        }
     }
 
     // Re-add the hyperlink, if the page somehow doesn't have enough
-    // memory to add it, we emit a warning and gracefully degrade to
-    // no hyperlink.
+    // memory to add it, gracefully degrade to no hyperlink.
     if (self.cursor.hyperlink) |link| {
         // So we don't attempt to free any memory in the replaced page.
         self.cursor.hyperlink_id = 0;
@@ -2240,8 +2233,8 @@ pub fn setAttribute(
     const old_style = self.cursor.style;
     errdefer {
         self.cursor.style = old_style;
-        self.manualStyleUpdate() catch |err| {
-            log.warn("setAttribute error restoring old style after failure err={}", .{err});
+        // Silent restore: logging under page pressure EXC_BAD_ACCESS (Botster).
+        self.manualStyleUpdate() catch {
             self.cursor.style = .{};
             self.manualStyleUpdate() catch unreachable;
         };
@@ -2438,51 +2431,22 @@ pub fn manualStyleUpdate(self: *Screen) PageList.IncreaseCapacityError!void {
     // if that makes a meaningful difference. Our priority is to keep print
     // fast because setting a ton of styles that do nothing is uncommon
     // and weird.
+    //
+    // trybotster/ghostty (Botster SEGV fix):
+    // Unique truecolor SGR storms (agent TUI paint) fill the page style map.
+    // The historical path called increaseCapacity / splitForCapacity here and
+    // EXC_BAD_ACCESS (stack) under that pressure — same class as OSC-8
+    // hyperlink insert. Prefer a single add attempt; on map pressure leave
+    // style_id at default (set above) and return success. Do **not** log:
+    // lib-vt emitLog also SEGV'd under related Botster fixtures.
+    // Cell styling after map pressure is best-effort; surviving the session is not.
     const id = page.styles.add(
         page.memory,
         self.cursor.style,
-    ) catch |err| id: {
-        // Our style map is full or needs to be rehashed, so we need to
-        // increase style capacity (or rehash).
-        const node = self.increaseCapacity(
-            self.cursor.page_pin.node,
-            switch (err) {
-                error.OutOfMemory => .styles,
-                error.NeedsRehash => null,
-            },
-        ) catch |increase_err| switch (increase_err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.OutOfSpace => space: {
-                // Out of space, we need to split the page. Split wherever
-                // is using less capacity and hope that works. If it doesn't
-                // work, we tried.
-                try self.splitForCapacity(self.cursor.page_pin.*);
-                break :space self.cursor.page_pin.node;
-            },
-        };
-
-        page = node.page();
-        break :id page.styles.add(
-            page.memory,
-            self.cursor.style,
-        ) catch |err2| switch (err2) {
-            error.OutOfMemory => {
-                // This shouldn't happen because increaseCapacity is
-                // guaranteed to increase our capacity by at least one and
-                // we only need one space, but again, I don't want to crash
-                // here so let's log loudly and reset.
-                log.err("style addition failed after capacity increase", .{});
-                return error.OutOfMemory;
-            },
-            error.NeedsRehash => {
-                // This should be impossible because we rehash above
-                // and rehashing should never result in a duplicate. But
-                // we don't want to simply hard crash so log it and
-                // clear our style.
-                log.err("style rehash resulted in needs rehash", .{});
-                return;
-            },
-        };
+    ) catch {
+        // style_id already style.default_id; cursor.style keeps the desired
+        // attributes for later eql/skip and future successful adds.
+        return;
     };
     errdefer page.styles.release(page.memory, id);
 
@@ -10867,6 +10831,29 @@ test "Screen: Botster OSC8 capacity pressure does not crash" {
         try s.startHyperlink(uri, null);
         s.endHyperlink();
         // Print a cell so page state advances like a real TUI.
+        try s.printString("x");
+    }
+}
+
+test "Screen: Botster unique truecolor style pressure does not crash" {
+    // Regression: dense unique CSI 38;2 / 48;2 styles (agent TUI paint) used to
+    // SEGV in manualStyleUpdate → increaseCapacity(.styles) (Botster sessions
+    // sess-1786295405 / sess-1786295414; offline: 200 unique styles → exit 139).
+    // Degrade to default style_id on map pressure; must not abort.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 226, .rows = 70, .max_scrollback_bytes = 10 * 1024 * 1024 });
+    defer s.deinit();
+
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const r: u8 = @truncate(i *% 17);
+        const g: u8 = @truncate(i *% 31);
+        const b: u8 = @truncate(i *% 47);
+        try s.setAttribute(.{ .direct_color_fg = .{ .r = r, .g = g, .b = b } });
+        try s.setAttribute(.{ .direct_color_bg = .{ .r = ~r, .g = ~g, .b = ~b } });
         try s.printString("x");
     }
 }
