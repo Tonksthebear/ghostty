@@ -2643,69 +2643,72 @@ pub fn startHyperlink(
     const max_attempts: u8 = 12;
     var attempt: u8 = 0;
     while (attempt < max_attempts) : (attempt += 1) {
-        if (self.startHyperlinkOnce(link)) {
-            // startHyperlinkOnce owns its own dupe; free our loop-owned copies.
-            self.alloc.free(uri_owned);
-            if (id_owned) |id| self.alloc.free(id);
-            return;
-        } else |err| switch (err) {
+        self.startHyperlinkOnce(link) catch |err| switch (err) {
             // An actual self.alloc OOM is a fatal error.
             error.OutOfMemory => return error.OutOfMemory,
 
             // strings table is out of memory, adjust it up
-            error.StringsOutOfMemory => self.increaseCapacity(
-                self.cursor.page_pin.node,
-                .string_bytes,
-            ) catch |cap_err| switch (cap_err) {
-                error.OutOfSpace, error.OutOfMemory => {
-                    log.warn(
-                        "(Screen.startHyperlink) capacity increase failed (string_bytes), dropping hyperlink err={}",
-                        .{cap_err},
-                    );
-                    self.alloc.free(uri_owned);
-                    if (id_owned) |id| self.alloc.free(id);
-                    return;
-                },
+            error.StringsOutOfMemory => {
+                _ = self.increaseCapacity(
+                    self.cursor.page_pin.node,
+                    .string_bytes,
+                ) catch |cap_err| switch (cap_err) {
+                    error.OutOfSpace, error.OutOfMemory => {
+                        log.warn(
+                            "(Screen.startHyperlink) capacity increase failed (string_bytes), dropping hyperlink err={}",
+                            .{cap_err},
+                        );
+                        self.alloc.free(uri_owned);
+                        if (id_owned) |id| self.alloc.free(id);
+                        return;
+                    },
+                };
+                continue;
             },
 
             // hyperlink set is out of memory, adjust it up
-            error.SetOutOfMemory => self.increaseCapacity(
-                self.cursor.page_pin.node,
-                .hyperlink_bytes,
-            ) catch |cap_err| switch (cap_err) {
-                error.OutOfSpace, error.OutOfMemory => {
-                    log.warn(
-                        "(Screen.startHyperlink) capacity increase failed (hyperlink_bytes), dropping hyperlink err={}",
-                        .{cap_err},
-                    );
-                    self.alloc.free(uri_owned);
-                    if (id_owned) |id| self.alloc.free(id);
-                    return;
-                },
+            error.SetOutOfMemory => {
+                _ = self.increaseCapacity(
+                    self.cursor.page_pin.node,
+                    .hyperlink_bytes,
+                ) catch |cap_err| switch (cap_err) {
+                    error.OutOfSpace, error.OutOfMemory => {
+                        log.warn(
+                            "(Screen.startHyperlink) capacity increase failed (hyperlink_bytes), dropping hyperlink err={}",
+                            .{cap_err},
+                        );
+                        self.alloc.free(uri_owned);
+                        if (id_owned) |id| self.alloc.free(id);
+                        return;
+                    },
+                };
+                continue;
             },
 
             // hyperlink set is too full, rehash it
-            error.SetNeedsRehash => self.increaseCapacity(
-                self.cursor.page_pin.node,
-                null,
-            ) catch |cap_err| switch (cap_err) {
-                error.OutOfSpace, error.OutOfMemory => {
-                    log.warn(
-                        "(Screen.startHyperlink) capacity rehash failed, dropping hyperlink err={}",
-                        .{cap_err},
-                    );
-                    self.alloc.free(uri_owned);
-                    if (id_owned) |id| self.alloc.free(id);
-                    return;
-                },
+            error.SetNeedsRehash => {
+                _ = self.increaseCapacity(
+                    self.cursor.page_pin.node,
+                    null,
+                ) catch |cap_err| switch (cap_err) {
+                    error.OutOfSpace, error.OutOfMemory => {
+                        log.warn(
+                            "(Screen.startHyperlink) capacity rehash failed, dropping hyperlink err={}",
+                            .{cap_err},
+                        );
+                        self.alloc.free(uri_owned);
+                        if (id_owned) |id| self.alloc.free(id);
+                        return;
+                    },
+                };
+                continue;
             },
-        }
+        };
 
-        // assertIntegrity on every retry was observed to contribute to deep
-        // stack use after long hyperlink-heavy streams; only check occasionally.
-        if (attempt == 0 or attempt == max_attempts - 1) {
-            self.assertIntegrity();
-        }
+        // startHyperlinkOnce owns its own dupe; free our loop-owned copies.
+        self.alloc.free(uri_owned);
+        if (id_owned) |id| self.alloc.free(id);
+        return;
     }
 
     log.warn(
