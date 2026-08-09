@@ -2640,15 +2640,13 @@ pub fn startHyperlink(
     self.startHyperlinkOnce(link) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Page memory / set pressure: drop the hyperlink rather than
-        // increaseCapacity (Botster fixture SEGV site).
+        // increaseCapacity. Do **not** log here: under long OSC-8 streams the
+        // lib-vt log path (emitLog/flush) itself EXC_BAD_ACCESS (Botster
+        // fixture). Silent degrade keeps the session alive.
         error.StringsOutOfMemory,
         error.SetOutOfMemory,
         error.SetNeedsRehash,
         => {
-            log.warn(
-                "(Screen.startHyperlink) page insert failed, dropping hyperlink err={}",
-                .{err},
-            );
             self.alloc.free(uri_owned);
             if (id_owned) |id| self.alloc.free(id);
             return;
