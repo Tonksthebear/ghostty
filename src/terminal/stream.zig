@@ -2370,7 +2370,7 @@ pub fn Stream(comptime H: type) type {
                         break :decsasd;
                     }
                     if (input.params.len != 1) {
-                        log.warn("unimplemented CSI callback: {f}", .{input});
+                        // Silent: lib-vt log path can SEGV under Botster load.
                         break :decsasd;
                     }
 
@@ -2378,7 +2378,6 @@ pub fn Stream(comptime H: type) type {
                         0 => .main,
                         1 => .status_line,
                         else => {
-                            log.warn("unimplemented CSI callback: {f}", .{input});
                             break :decsasd;
                         },
                     };
@@ -2386,7 +2385,12 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.active_status_display, display);
                 },
 
-                else => log.warn("unimplemented CSI action: {f}", .{input}),
+                // trybotster/ghostty (Botster SEGV fix): do not log unimplemented
+                // CSI. Under agent TUI streams the lib-vt log path (emitLog /
+                // Writer.drain / host callback) EXC_BAD_ACCESS (stack) — see
+                // sess-1786319046 offline: ring ends mid-CSI, next bytes form
+                // an unimplemented action and log.warn SEGV'd the session.
+                else => {},
             }
         }
 
