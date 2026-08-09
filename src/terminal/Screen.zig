@@ -644,13 +644,10 @@ pub fn increaseCapacity(
         self.cursor.hyperlink_id = 0;
         self.cursor.hyperlink = null;
 
-        // Re-add
-        self.startHyperlinkOnce(link.*) catch |err| {
-            // TODO: Should we increase the capacity further in this case?
-            log.warn(
-                "(Screen.increaseCapacity) Failed to add cursor hyperlink back to page, err={}",
-                .{err},
-            );
+        // Re-add. On failure degrade to no hyperlink. Do not log: under
+        // OSC-8 page pressure lib-vt emitLog can EXC_BAD_ACCESS (Botster).
+        self.startHyperlinkOnce(link.*) catch {
+            // leave cursor without hyperlink; free below
         };
 
         // Remove our old link
@@ -2643,10 +2640,20 @@ pub fn startHyperlink(
         // increaseCapacity. Do **not** log here: under long OSC-8 streams the
         // lib-vt log path (emitLog/flush) itself EXC_BAD_ACCESS (Botster
         // fixture). Silent degrade keeps the session alive.
+        //
+        // Note: startHyperlinkOnce ends any prior hyperlink before insert, so
+        // a failed install leaves the cursor with no active hyperlink (not
+        // the previous one). SetNeedsRehash is treated like full: dead slots
+        // are not reclaimed here (increaseCapacity rehash is the SEGV site).
         error.StringsOutOfMemory,
         error.SetOutOfMemory,
         error.SetNeedsRehash,
         => {
+            // Match OOM errdefer: do not burn an implicit id on a no-op start.
+            switch (link.id) {
+                .explicit => {},
+                .implicit => self.cursor.hyperlink_implicit_id -%= 1,
+            }
             self.alloc.free(uri_owned);
             if (id_owned) |id| self.alloc.free(id);
             return;
@@ -2658,9 +2665,9 @@ pub fn startHyperlink(
     if (id_owned) |id| self.alloc.free(id);
 }
 
-/// This is like startHyperlink but if we have to adjust page capacities
-/// this returns error.PageAdjusted. This is useful so that we unwind
-/// all the previous state and try again.
+/// Single insert attempt into page memory. Caller handles page-pressure
+/// errors (do not grow here — Botster SEGV pin). Ownership: on success the
+/// heap Hyperlink is stored on the cursor; on error, errdefers free it.
 fn startHyperlinkOnce(
     self: *Screen,
     source: hyperlink.Hyperlink,
