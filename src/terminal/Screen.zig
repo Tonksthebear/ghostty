@@ -2606,24 +2606,23 @@ pub fn appendGrapheme(
 /// this state. Note that various terminal operations may clear the hyperlink
 /// state, such as switching screens (alt screen).
 ///
-/// trybotster/ghostty: own URI/id across capacity-retry loops and cap retries.
-/// Unbounded increaseCapacity under OSC 8 churn can destroy the cursor page
-/// while still referencing transient slices, and can stack-blow on long TUI
-/// streams (Botster agent paint). On capacity exhaustion we degrade to no
-/// hyperlink instead of SEGV/infinite retry.
+/// trybotster/ghostty (Botster SEGV fix):
+/// After long OSC-8-heavy agent TUI streams, `increaseCapacity` during
+/// hyperlink insert can EXC_BAD_ACCESS (stack/page clone path). Prefer a
+/// single insert attempt and **degrade to no hyperlink** on page-memory
+/// pressure instead of growing the page. Real OOM from `self.alloc` still
+/// surfaces. Hyperlink styling is best-effort; surviving the session is not.
 pub fn startHyperlink(
     self: *Screen,
     uri: []const u8,
     id_: ?[]const u8,
 ) PageList.IncreaseCapacityError!void {
-    // Own URI/id for the full retry loop. Callers may pass OSC buffer or
-    // page-backed slices that do not survive increaseCapacity/page clone.
+    // Own URI/id so callers may pass OSC buffer slices safely.
     const uri_owned = try self.alloc.dupe(u8, uri);
     errdefer self.alloc.free(uri_owned);
     const id_owned: ?[]u8 = if (id_) |id| try self.alloc.dupe(u8, id) else null;
     errdefer if (id_owned) |id| self.alloc.free(id);
 
-    // Create our pending entry.
     const link: hyperlink.Hyperlink = .{
         .uri = uri_owned,
         .id = if (id_owned) |id| .{
@@ -2638,83 +2637,25 @@ pub fn startHyperlink(
         .implicit => self.cursor.hyperlink_implicit_id -%= 1,
     };
 
-    // Bounded retries — doubling capacity a few times is enough; more usually
-    // means OutOfSpace / pathological set state (seen as SEGV in the wild).
-    const max_attempts: u8 = 12;
-    var attempt: u8 = 0;
-    while (attempt < max_attempts) : (attempt += 1) {
-        self.startHyperlinkOnce(link) catch |err| switch (err) {
-            // An actual self.alloc OOM is a fatal error.
-            error.OutOfMemory => return error.OutOfMemory,
+    self.startHyperlinkOnce(link) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Page memory / set pressure: drop the hyperlink rather than
+        // increaseCapacity (Botster fixture SEGV site).
+        error.StringsOutOfMemory,
+        error.SetOutOfMemory,
+        error.SetNeedsRehash,
+        => {
+            log.warn(
+                "(Screen.startHyperlink) page insert failed, dropping hyperlink err={}",
+                .{err},
+            );
+            self.alloc.free(uri_owned);
+            if (id_owned) |id| self.alloc.free(id);
+            return;
+        },
+    };
 
-            // strings table is out of memory, adjust it up
-            error.StringsOutOfMemory => {
-                _ = self.increaseCapacity(
-                    self.cursor.page_pin.node,
-                    .string_bytes,
-                ) catch |cap_err| switch (cap_err) {
-                    error.OutOfSpace, error.OutOfMemory => {
-                        log.warn(
-                            "(Screen.startHyperlink) capacity increase failed (string_bytes), dropping hyperlink err={}",
-                            .{cap_err},
-                        );
-                        self.alloc.free(uri_owned);
-                        if (id_owned) |id| self.alloc.free(id);
-                        return;
-                    },
-                };
-                continue;
-            },
-
-            // hyperlink set is out of memory, adjust it up
-            error.SetOutOfMemory => {
-                _ = self.increaseCapacity(
-                    self.cursor.page_pin.node,
-                    .hyperlink_bytes,
-                ) catch |cap_err| switch (cap_err) {
-                    error.OutOfSpace, error.OutOfMemory => {
-                        log.warn(
-                            "(Screen.startHyperlink) capacity increase failed (hyperlink_bytes), dropping hyperlink err={}",
-                            .{cap_err},
-                        );
-                        self.alloc.free(uri_owned);
-                        if (id_owned) |id| self.alloc.free(id);
-                        return;
-                    },
-                };
-                continue;
-            },
-
-            // hyperlink set is too full, rehash it
-            error.SetNeedsRehash => {
-                _ = self.increaseCapacity(
-                    self.cursor.page_pin.node,
-                    null,
-                ) catch |cap_err| switch (cap_err) {
-                    error.OutOfSpace, error.OutOfMemory => {
-                        log.warn(
-                            "(Screen.startHyperlink) capacity rehash failed, dropping hyperlink err={}",
-                            .{cap_err},
-                        );
-                        self.alloc.free(uri_owned);
-                        if (id_owned) |id| self.alloc.free(id);
-                        return;
-                    },
-                };
-                continue;
-            },
-        };
-
-        // startHyperlinkOnce owns its own dupe; free our loop-owned copies.
-        self.alloc.free(uri_owned);
-        if (id_owned) |id| self.alloc.free(id);
-        return;
-    }
-
-    log.warn(
-        "(Screen.startHyperlink) exceeded {d} capacity retries, dropping hyperlink",
-        .{max_attempts},
-    );
+    // startHyperlinkOnce owns its own dupe; free our copies.
     self.alloc.free(uri_owned);
     if (id_owned) |id| self.alloc.free(id);
 }
@@ -10898,6 +10839,30 @@ test "Screen: hyperlink start/end" {
     {
         const page = s.cursor.page_pin.node.page();
         try testing.expectEqual(0, page.hyperlink_set.count());
+    }
+}
+
+
+test "Screen: Botster OSC8 capacity pressure does not crash" {
+    // Regression: long agent TUI streams with many unique OSC 8 hyperlinks
+    // used to SEGV inside increaseCapacity (Botster vt-replay fixture).
+    // We must complete without process abort even if hyperlinks are dropped.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 226, .rows = 70, .max_scrollback_bytes = 10 * 1024 * 1024 });
+    defer s.deinit();
+
+    var uri_buf: [512]u8 = undefined;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const uri = try std.fmt.bufPrint(&uri_buf, "file:///Users/example/path/segment-{d}/botster-hub/status", .{i});
+        // Must not panic/SEGV — failure degrades to no hyperlink.
+        try s.startHyperlink(uri, null);
+        s.endHyperlink();
+        // Print a cell so page state advances like a real TUI.
+        try s.printString("x");
     }
 }
 
