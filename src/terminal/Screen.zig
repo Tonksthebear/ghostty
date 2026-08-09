@@ -2684,6 +2684,13 @@ pub fn endHyperlink(self: *Screen) void {
 }
 
 /// Set the current hyperlink state on the current cell.
+///
+/// trybotster/ghostty (Botster SEGV fix):
+/// When the page hyperlink map is full, do **not** call increaseCapacity.
+/// That path EXC_BAD_ACCESS (stack) under long agent TUI streams with active
+/// OSC-8 + cell paint (sess-1786319046 offline: print → cursorSetHyperlink →
+/// increaseCapacity(.hyperlink_bytes)). Leave the cell without a hyperlink.
+/// Cursor hyperlink state stays active for later cells if capacity frees.
 pub fn cursorSetHyperlink(self: *Screen) PageList.IncreaseCapacityError!void {
     assert(self.cursor.hyperlink_id != 0);
 
@@ -2697,54 +2704,8 @@ pub fn cursorSetHyperlink(self: *Screen) PageList.IncreaseCapacityError!void {
         page.hyperlink_set.use(page.memory, self.cursor.hyperlink_id);
         return;
     } else |err| switch (err) {
-        // hyperlink_map is out of space, realloc the page to be larger
-        error.HyperlinkMapOutOfMemory => {
-            // Attempt to allocate the space that would be required to
-            // insert a new copy of the cursor hyperlink uri in to the
-            // string alloc, since right now increaseCapacity always just
-            // adds an extra copy even if one already exists in the page.
-            // If this alloc fails then we know we also need to grow our
-            // string bytes.
-            //
-            // FIXME: increaseCapacity should not do this.
-            while (self.cursor.hyperlink) |link| {
-                if (page.string_alloc.alloc(
-                    u8,
-                    page.memory,
-                    link.uri.len,
-                )) |slice| {
-                    // We don't bother freeing because we're
-                    // about to free the entire page anyway.
-                    _ = slice;
-                    break;
-                } else |_| {}
-
-                // We didn't have enough room, let's increase string bytes
-                const new_node = try self.increaseCapacity(
-                    self.cursor.page_pin.node,
-                    .string_bytes,
-                );
-                assert(new_node == self.cursor.page_pin.node);
-                page = new_node.page();
-            }
-
-            // The hyperlink map is fixed-capacity, so reaching this error
-            // means live entries fill the usable map capacity and the page
-            // must grow.
-            _ = try self.increaseCapacity(
-                self.cursor.page_pin.node,
-                .hyperlink_bytes,
-            );
-
-            // Retry
-            //
-            // We check that the cursor hyperlink hasn't been destroyed
-            // by the capacity adjustment first though- since despite the
-            // terrible code above, that can still apparently happen ._.
-            if (self.cursor.hyperlink_id > 0) {
-                return try self.cursorSetHyperlink();
-            }
-        },
+        // Map full: degrade silently. Do not grow page / do not log.
+        error.HyperlinkMapOutOfMemory => return,
     }
 }
 

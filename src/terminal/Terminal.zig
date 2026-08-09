@@ -1641,9 +1641,11 @@ fn printCell(
     // handles clearing the old hyperlink and an optimization if we're
     // overwriting the same hyperlink.
     if (self.screens.active.cursor.hyperlink_id > 0) {
-        self.screens.active.cursorSetHyperlink() catch |err| {
+        // Botster: cursorSetHyperlink degrades silently on map pressure
+        // (no increaseCapacity). Do not log here — emitLog SEGV'd under
+        // related OSC-8 / style fixtures.
+        self.screens.active.cursorSetHyperlink() catch {
             @branchHint(.unlikely);
-            log.warn("error reallocating for more hyperlink space, ignoring hyperlink err={}", .{err});
             assert(!cell.hyperlink);
         };
     } else if (had_hyperlink) {
