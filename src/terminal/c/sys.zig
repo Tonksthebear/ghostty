@@ -185,6 +185,12 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // trybotster/ghostty (Botster SEGV fix):
+    // Never format/dispatch warn/info/debug from inside VT parse. Agent TUI
+    // streams hit log.warn (e.g. invalid CUP / unimplemented CSI) and the
+    // Writer.print + emitLog path EXC_BAD_ACCESS (stack) mid-vt_write
+    // (sess-1786319046: CSI 60;56;6H after dense paint). Errors still go out.
+    if (comptime level != .err) return;
     if (global.log == null) return;
 
     const scope_text: []const u8 = if (scope == .default) "" else @tagName(scope);
