@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const lib = @import("../lib.zig");
 const CAllocator = lib.alloc.Allocator;
 const terminal_sys = @import("../sys.zig");
+const stderr = @import("../../os/stderr.zig");
 const Result = @import("result.zig").Result;
 
 /// C: GhosttySysImage
@@ -217,8 +218,12 @@ pub fn logFn(
 /// Formats each message as "[level](scope): message\n". Can be passed
 /// directly to ghostty_sys_set(GHOSTTY_SYS_OPT_LOG, &ghostty_sys_log_stderr).
 ///
-/// Uses std.debug.lockStderrWriter for thread-safe, mutex-protected output.
-/// On freestanding/wasm targets this is a no-op (no stderr available).
+/// Each log line is emitted with a single raw write to stderr, which keeps
+/// concurrent log lines from interleaving. We intentionally avoid
+/// `std.debug.lockStderr` because it routes through `std.Options.debug_io`
+/// and would keep the entire `std.Io.Threaded` vtable alive in the binary
+/// (see `os/stderr.zig`). On freestanding/wasm targets this is a no-op
+/// (no stderr available).
 pub fn logStderr(
     _: ?*anyopaque,
     level: LogLevel,
@@ -239,16 +244,32 @@ pub fn logStderr(
         .debug => "debug",
     };
 
-    var buffer: [64]u8 = undefined;
-    var locked_stderr = std.debug.lockStderr(&buffer);
-    defer std.debug.unlockStderr();
-    nosuspend {
-        if (scope.len > 0) {
-            locked_stderr.file_writer.interface.print("[{s}]({s}): {s}\n", .{ level_text, scope, message }) catch {};
-        } else {
-            locked_stderr.file_writer.interface.print("[{s}]: {s}\n", .{ level_text, message }) catch {};
-        }
+    // Large enough for a full logFn chunk plus the level/scope prefix.
+    var buffer: [LogEmitter.buffer_size + 128]u8 = undefined;
+    const line: ?[]const u8 = if (scope.len > 0)
+        std.fmt.bufPrint(&buffer, "[{s}]({s}): {s}\n", .{ level_text, scope, message }) catch null
+    else
+        std.fmt.bufPrint(&buffer, "[{s}]: {s}\n", .{ level_text, message }) catch null;
+    if (line) |v| {
+        stderr.write(v);
+        return;
     }
+
+    // The line didn't fit in our buffer (an embedder called us directly
+    // with a very large message). Fall back to writing the pieces
+    // separately; interleaving with other threads is possible here but
+    // this is a best-effort diagnostic path.
+    stderr.write("[");
+    stderr.write(level_text);
+    stderr.write("]");
+    if (scope.len > 0) {
+        stderr.write("(");
+        stderr.write(scope);
+        stderr.write(")");
+    }
+    stderr.write(": ");
+    stderr.write(message);
+    stderr.write("\n");
 }
 
 test "set decode_png with null clears" {
@@ -328,7 +349,7 @@ test "logFn small message single chunk" {
         global.log = null;
     }
 
-    logFn(.info, .default, "hello", .{});
+    logFn(.err, .default, "hello", .{});
 
     try std.testing.expectEqual(@as(usize, 1), S.call_count);
     try std.testing.expectEqual(@as(usize, 5), S.total_len);
@@ -358,7 +379,7 @@ test "logFn message exceeding chunk size is split" {
     // Format a message larger than the 2048-byte buffer.
     // 'A' repeated 3000 times via a fill format.
     const fill: [3000]u8 = .{0x41} ** 3000;
-    logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
+    logFn(.err, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expect(S.call_count >= 2);
     try std.testing.expectEqual(@as(usize, 3000), S.total_len);
@@ -386,7 +407,7 @@ test "logFn message exactly at chunk boundary" {
 
     // Exactly 2048 bytes — should emit one full chunk, no remainder.
     const fill: [2048]u8 = .{0x42} ** 2048;
-    logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
+    logFn(.err, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expectEqual(@as(usize, 1), S.call_count);
     try std.testing.expectEqual(@as(usize, 2048), S.total_len);
@@ -414,10 +435,32 @@ test "logFn message exactly double chunk size" {
 
     // Exactly 4096 bytes — should emit exactly two full chunks.
     const fill: [4096]u8 = .{0x43} ** 4096;
-    logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
+    logFn(.err, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expectEqual(@as(usize, 2), S.call_count);
     try std.testing.expectEqual(@as(usize, 4096), S.total_len);
+}
+
+test "logFn drops non-error messages" {
+    const S = struct {
+        var call_count: usize = 0;
+
+        fn logCb(_: ?*anyopaque, _: LogLevel, _: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(lib.calling_conv) void {
+            call_count += 1;
+        }
+    };
+
+    S.call_count = 0;
+    global.log = @ptrCast(&S.logCb);
+    defer {
+        global.log = null;
+    }
+
+    logFn(.warn, .default, "warning", .{});
+    logFn(.info, .default, "info", .{});
+    logFn(.debug, .default, "debug", .{});
+
+    try std.testing.expectEqual(@as(usize, 0), S.call_count);
 }
 
 test "set userdata" {

@@ -51,17 +51,25 @@ pub const Io = struct {
     impl: Impl,
 
     /// Platform-specific storage backing the public `std.Io` value.
-    const Impl = if (builtin.os.tag != .freestanding)
+    ///
+    /// Where supported (POSIX) we use TinyIo, which is stateless and
+    /// supports exactly the operations the terminal needs at a fraction
+    /// of the code size (see lib/TinyIo.zig). On Windows we use
+    /// `std.Io.Threaded` since TinyIo doesn't implement the NT
+    /// operations. On the remaining targets (e.g. freestanding wasm)
+    /// TinyIo degrades to `std.Io.failing`, which is correct: they have
+    /// no filesystem.
+    const Impl = if (builtin.os.tag == .windows)
         *std.Io.Threaded
     else
-        void;
+        lib.TinyIo;
 
     /// Allocation failures possible while constructing an I/O owner.
     pub const Error = error{OutOfMemory};
 
     /// Allocate the native I/O implementation when the platform requires it.
     pub fn init(alloc: std.mem.Allocator) Error!Io {
-        if (comptime builtin.os.tag == .freestanding) return .{ .impl = {} };
+        if (comptime Impl == lib.TinyIo) return .{ .impl = .init };
 
         const ptr = alloc.create(std.Io.Threaded) catch
             return error.OutOfMemory;
@@ -71,15 +79,15 @@ pub const Io = struct {
 
     /// Return the value passed to native terminal construction and decoding.
     pub fn io(self: Io) std.Io {
-        if (comptime builtin.os.tag == .freestanding) {
-            return std.Io.failing;
-        }
         return self.impl.io();
     }
 
     /// Release an I/O implementation that has not already been transferred.
     pub fn deinit(self: Io, alloc: std.mem.Allocator) void {
-        if (comptime builtin.os.tag != .freestanding) {
+        // Note: this must not name `std.Io.Threaded` in the condition
+        // because resolving that type trips its container-level comptime
+        // checks on targets it doesn't support (e.g. wasm32-freestanding).
+        if (comptime Impl != lib.TinyIo) {
             self.impl.deinit();
             alloc.destroy(self.impl);
         }
@@ -174,7 +182,7 @@ pub const UnknownSequence = union(Tag) {
         // A future borrowed CSI payload may need parameter, separator, and
         // intermediate arrays. Reserve 128 bytes so that representation and
         // other structured sequence types can be added without an ABI break.
-        [16]u64,
+        .{ .padding = [16]u64 },
     );
     pub const C = c_union.C;
     pub const CValue = c_union.CValue;
@@ -571,12 +579,15 @@ pub const FromDecodedError = error{
 /// This function consumes `io` on every path. The decoded terminal is
 /// transferred only after its final heap address has been allocated; its
 /// continuation remains in `decoded` and is replayed before returning.
-/// Replay uses a temporary exact-size tracker which is disabled before the
-/// terminal crosses the C ABI, restoring the ordinary C default policy.
+/// `continuation_max_bytes` selects the returned terminal's tracking policy:
+/// zero uses a temporary exact-size tracker and restores the ordinary C
+/// default before returning, while a nonzero value leaves tracking enabled
+/// with that limit.
 pub fn fromDecoded(
     alloc: std.mem.Allocator,
     io: Io,
     decoded: *snapshot_core.Decoded,
+    continuation_max_bytes: usize,
 ) FromDecodedError!Terminal {
     const native = alloc.create(ZigTerminal) catch {
         io.deinit(alloc);
@@ -588,11 +599,18 @@ pub fn fromDecoded(
         .ground => "",
         .bytes => |bytes| bytes,
     };
+    assert(continuation_max_bytes == 0 or
+        continuation.len <= continuation_max_bytes);
 
-    // Non-ground state needs tracking only long enough to verify that replay
-    // reconstructed the exact canonical continuation. Ground state needs no
-    // tracker at all.
-    const terminal = wrap(alloc, native, io, continuation.len) catch |err| {
+    // Without opt-in retention, non-ground state needs tracking only long
+    // enough to verify that replay reconstructed the exact canonical
+    // continuation. With retention, even ground state needs a tracker so its
+    // continuation can be exported successfully as an empty slice.
+    const tracker_max_bytes = if (continuation_max_bytes > 0)
+        continuation_max_bytes
+    else
+        continuation.len;
+    const terminal = wrap(alloc, native, io, tracker_max_bytes) catch |err| {
         native.deinit(alloc);
         alloc.destroy(native);
         io.deinit(alloc);
@@ -602,8 +620,8 @@ pub fn fromDecoded(
 
     if (continuation.len > 0) {
         restoreContinuation(terminal, continuation) catch |err| return switch (err) {
-            // The decoded bytes exactly fit this fresh tracker's cap, so
-            // losing them while replaying can only be an allocation failure.
+            // The decoded bytes fit this fresh tracker's cap, so losing them
+            // while replaying can only be an allocation failure.
             error.OutOfMemory,
             error.ContinuationUnavailable,
             => error.OutOfMemory,
@@ -613,9 +631,12 @@ pub fn fromDecoded(
         };
     }
 
-    // Decoder validation limits are not terminal runtime policy. A restored
-    // terminal always starts with the same disabled tracking default as new.
-    setContinuationMaxBytes(terminal.?, default_continuation_max_bytes);
+    // Unless the decoder opted into retention, restore the same disabled
+    // tracking default used by newly created C terminals. Disabling tracking
+    // does not alter the parser or UTF-8 state reconstructed above.
+    if (continuation_max_bytes == 0) {
+        setContinuationMaxBytes(terminal.?, default_continuation_max_bytes);
+    }
     return terminal;
 }
 
@@ -687,6 +708,32 @@ pub fn vt_write(
 ) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     wrapper.stream.nextSlice(ptr[0..len]);
+}
+
+pub fn vt_write_until_ground(
+    terminal_: Terminal,
+    ptr_: ?[*]const u8,
+    len: usize,
+    out_consumed_: ?*usize,
+) callconv(lib.calling_conv) Result {
+    const out_consumed = out_consumed_ orelse return .invalid_value;
+    out_consumed.* = 0;
+
+    const wrapper = terminal_ orelse return .invalid_value;
+    const input: []const u8 = if (ptr_) |ptr|
+        ptr[0..len]
+    else if (len == 0)
+        ""
+    else
+        return .invalid_value;
+
+    if (wrapper.stream.nextSliceUntilGround(input)) |consumed| {
+        out_consumed.* = consumed;
+        return .success;
+    }
+
+    out_consumed.* = len;
+    return .no_value;
 }
 
 pub const ContinuationWriteError = error{
@@ -776,15 +823,20 @@ pub fn continuation_write(
 
     // The callback was validated above, so invalid_write can only mean output
     // accounting overflow. Keep that distinct from callback rejection.
-    var adapter: c_io.WriterAdapter = .init(writer);
-    continuationWriteIo(terminal_, &adapter.interface) catch |err| {
-        if (err == error.WriteFailed) {
-            if (adapter.invalid_write) return .limit_exceeded;
-            if (adapter.callback_failed) return .io_error;
-        }
-        return continuationErrorResult(err);
-    };
-    return .success;
+    var buffer: [c_io.WriterAdapter.recommended_buffer_len]u8 = undefined;
+    var adapter: c_io.WriterAdapter = .initBuffered(writer, &buffer);
+    write: {
+        continuationWriteIo(terminal_, &adapter.interface) catch |err| switch (err) {
+            error.WriteFailed => break :write,
+            else => return continuationErrorResult(err),
+        };
+        adapter.interface.flush() catch break :write;
+        return .success;
+    }
+
+    if (adapter.invalid_write) return .limit_exceeded;
+    if (adapter.callback_failed) return .io_error;
+    return continuationErrorResult(error.WriteFailed);
 }
 
 pub fn continuation_buf(
@@ -1320,6 +1372,8 @@ pub const TerminalData = enum(c_int) {
     scrollback_max_lines = 35,
     continuation_max_bytes = 36,
     mode = 37,
+    vt_ground = 38,
+    cursor_at_prompt = 39,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1331,6 +1385,8 @@ pub const TerminalData = enum(c_int) {
             .mouse_tracking,
             .viewport_active,
             .vt_processing_error,
+            .vt_ground,
+            .cursor_at_prompt,
             => bool,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
@@ -1481,6 +1537,7 @@ fn getTyped(
         ),
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
         .vt_processing_error => out.* = wrapper.stream.handler.semantic_failure,
+        .vt_ground => out.* = wrapper.stream.ground(),
         .scrollback_max_bytes => {
             const max = t.screens.get(.primary).?.pages.limits.bytes.explicit;
             if (max == std.math.maxInt(usize)) return .no_value;
@@ -1496,6 +1553,7 @@ fn getTyped(
             const mode = out.toMode() orelse return .invalid_value;
             out.value = t.modes.get(mode);
         },
+        .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
     }
 
     return .success;
@@ -2490,6 +2548,189 @@ test "vt_write" {
     try testing.expectEqualStrings("Hello", str);
 }
 
+test "vt_write_until_ground result contract" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // Input remains untouched when the stream is already at ground.
+    var consumed: usize = 99;
+    const untouched = "unprocessed";
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until_ground(t, untouched, untouched.len, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 0), consumed);
+
+    // Complete a split CSI and stop before inspecting the printable suffix.
+    vt_write(t, "\x1b[31", 4);
+    const input = "mABC\x1b[";
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until_ground(t, input, input.len, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expect(t.?.stream.ground());
+
+    var str = try t.?.terminal.plainString(testing.allocator);
+    try testing.expectEqualStrings("", str);
+    testing.allocator.free(str);
+
+    // The untouched suffix can be processed after work at the boundary.
+    vt_write(t, input.ptr + consumed, input.len - consumed);
+    str = try t.?.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("ABC", str);
+    try testing.expect(!t.?.stream.ground());
+
+    // Exhausting input while unfinished is distinct from reaching ground on
+    // the final byte, even though both consume the entire input.
+    try testing.expectEqual(
+        Result.no_value,
+        vt_write_until_ground(t, "123", 3, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 3), consumed);
+    try testing.expect(!t.?.stream.ground());
+
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until_ground(t, "m", 1, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expect(t.?.stream.ground());
+}
+
+test "vt_write_until_ground handles UTF-8 and abort boundaries" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var ground: bool = false;
+    try testing.expectEqual(
+        Result.success,
+        get(t, .vt_ground, @ptrCast(&ground)),
+    );
+    try testing.expect(ground);
+
+    vt_write(t, &.{0xF0}, 1);
+    try testing.expectEqual(
+        Result.success,
+        get(t, .vt_ground, @ptrCast(&ground)),
+    );
+    try testing.expect(!ground);
+
+    const utf8_suffix = [_]u8{ 0x9F, 0x98, 0x84 };
+    var consumed: usize = 99;
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until_ground(t, &utf8_suffix, utf8_suffix.len, &consumed),
+    );
+    try testing.expectEqual(utf8_suffix.len, consumed);
+    try testing.expect(t.?.stream.ground());
+
+    // A malformed continuation resets the decoder and reaches ground after
+    // processing the retry byte.
+    vt_write(t, &.{ 0xE0, 0xA0 }, 2);
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until_ground(t, "A", 1, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expect(t.?.stream.ground());
+
+    vt_write(t, "\x1b[123", 5);
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until_ground(t, &.{0x18}, 1, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expect(t.?.stream.ground());
+}
+
+test "vt_write_until_ground invokes effects only for consumed input" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var bell_count: usize = 0;
+
+        fn bell(_: Terminal, _: ?*anyopaque) callconv(lib.calling_conv) void {
+            bell_count += 1;
+        }
+    };
+    S.bell_count = 0;
+    try testing.expectEqual(Result.success, set(t, .bell, @ptrCast(&S.bell)));
+
+    vt_write(t, "\x1b[31", 4);
+    const input = "m\x07";
+    var consumed: usize = 99;
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until_ground(t, input, input.len, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expectEqual(@as(usize, 0), S.bell_count);
+
+    vt_write(t, input.ptr + consumed, input.len - consumed);
+    try testing.expectEqual(@as(usize, 1), S.bell_count);
+}
+
+test "vt_write_until_ground validates arguments" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var consumed: usize = 99;
+    try testing.expectEqual(
+        Result.invalid_value,
+        vt_write_until_ground(null, "x", 1, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 0), consumed);
+
+    consumed = 99;
+    try testing.expectEqual(
+        Result.invalid_value,
+        vt_write_until_ground(t, null, 1, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 0), consumed);
+
+    try testing.expectEqual(
+        Result.invalid_value,
+        vt_write_until_ground(t, "", 0, null),
+    );
+
+    // NULL represents a valid empty slice. While unfinished it consumes zero
+    // bytes and reports that no ground boundary was found.
+    vt_write(t, "\x1b[", 2);
+    consumed = 99;
+    try testing.expectEqual(
+        Result.no_value,
+        vt_write_until_ground(t, null, 0, &consumed),
+    );
+    try testing.expectEqual(@as(usize, 0), consumed);
+}
+
 test "vt_write split escape sequence" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
@@ -2642,6 +2883,31 @@ test "get cursor_visible" {
     try testing.expectEqual(Result.success, set(t, .mode, @ptrCast(&config)));
     try testing.expectEqual(Result.success, get(t, .cursor_visible, @ptrCast(&visible)));
     try testing.expect(!visible);
+}
+
+test "get cursor_at_prompt" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var at_prompt: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_at_prompt, @ptrCast(&at_prompt)));
+    try testing.expect(!at_prompt);
+
+    const prompt_start = "\x1b]133;A\x07";
+    vt_write(t, prompt_start, prompt_start.len);
+    try testing.expectEqual(Result.success, get(t, .cursor_at_prompt, @ptrCast(&at_prompt)));
+    try testing.expect(at_prompt);
+
+    const alternate_screen = "\x1b[?1049h";
+    vt_write(t, alternate_screen, alternate_screen.len);
+    try testing.expectEqual(Result.success, get(t, .cursor_at_prompt, @ptrCast(&at_prompt)));
+    try testing.expect(!at_prompt);
 }
 
 test "get active_screen" {
@@ -5157,6 +5423,8 @@ test "set color sets dirty flag" {
 }
 
 test "set glyph protocol disables APC handling and clears glossary" {
+    if (comptime !build_options.glyph_protocol) return error.SkipZigTest;
+
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,

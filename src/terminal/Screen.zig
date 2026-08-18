@@ -3999,7 +3999,7 @@ test "Screen cursorCopy hyperlink deref" {
     try testing.expect(s2.cursor.hyperlink_id == 0);
 }
 
-test "Screen write regrows compacted page capacity" {
+test "Screen write regrows grapheme capacity and degrades optional metadata" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -4023,9 +4023,7 @@ test "Screen write regrows compacted page capacity" {
         s.cursorReload();
     }
 
-    // Styled write: exercises the manualStyleUpdate single-retry
-    // path. Prior to increaseCapacity handling zero dimensions, the
-    // retry would fail and the style would be dropped.
+    // Style metadata degrades to the default style under page pressure.
     try s.setAttribute(.{ .bold = {} });
     try s.testWriteString("A");
 
@@ -4035,16 +4033,15 @@ test "Screen write regrows compacted page capacity" {
     try s.testWriteString("a");
     try s.appendGrapheme(s.cursorCellLeft(1), 0x0301);
 
-    // Hyperlink: exercises the startHyperlink retry loop, which used
-    // to loop forever when capacity growth from zero didn't grow.
+    // Hyperlink metadata degrades to no hyperlink under page pressure.
     try s.startHyperlink("https://example.com/", null);
     try s.testWriteString("B");
     s.endHyperlink();
 
-    // Verify the content landed on the page.
+    // Required text data grows its capacity. Optional metadata does not.
     const page = s.cursor.page_pin.node.page();
-    try testing.expect(page.styles.count() >= 1);
-    try testing.expect(page.hyperlink_set.count() >= 1);
+    try testing.expectEqual(@as(usize, 0), page.styles.count());
+    try testing.expectEqual(@as(usize, 0), page.hyperlink_set.count());
     try testing.expect(page.graphemeCount() >= 1);
 }
 
@@ -4629,7 +4626,7 @@ test "Screen: cursorAbsolute across pages preserves style" {
     }
 }
 
-test "Screen: cursorAbsolute to page with insufficient capacity" {
+test "Screen: cursorAbsolute degrades style on insufficient capacity" {
     // This test checks for a very specific edge case
     // which previously resulted in memory corruption.
     //
@@ -4684,21 +4681,15 @@ test "Screen: cursorAbsolute to page with insufficient capacity" {
         try testing.expect(styleval.flags.bold);
     }
 
-    // Go back up into the start page and we should still have that style.
+    // Go back to the full page. Keep the requested style value, but use the
+    // default style ID because the page cannot store another style.
     s.cursorAbsolute(1, 1);
     {
         const cur_page = s.cursor.page_pin.node.page();
-        // The page we're on now should NOT equal start_page, since its
-        // capacity should have been adjusted, which invalidates our ptr.
-        try testing.expect(start_page != cur_page);
-        // To make sure we DID change pages we check we're not on new_page.
+        try testing.expectEqual(start_page, cur_page);
         try testing.expect(new_page != cur_page);
-
-        const styleval = cur_page.styles.get(
-            cur_page.memory,
-            s.cursor.style_id,
-        );
-        try testing.expect(styleval.flags.bold);
+        try testing.expect(s.cursor.style.flags.bold);
+        try testing.expectEqual(style.default_id, s.cursor.style_id);
     }
 
     s.cursor.page_pin.node.page().assertIntegrity();
@@ -5988,10 +5979,9 @@ test "Screen: scroll above hyperlink-dense row to fresh page" {
         try s.testWriteString("A");
         s.endHyperlink();
     }
-    try testing.expectEqual(
-        @as(usize, s.pages.cols),
-        s.cursor.page_pin.node.page().hyperlink_set.count(),
-    );
+    const retained_hyperlinks = s.cursor.page_pin.node.page().hyperlink_set.count();
+    try testing.expect(retained_hyperlinks > 0);
+    try testing.expect(retained_hyperlinks < s.pages.cols);
 
     // Move the cursor above the bottom row and scroll. The dense row is
     // pushed across the page boundary into the freshly allocated page.
@@ -6023,25 +6013,30 @@ test "Screen: scroll above hyperlink-dense row to fresh page" {
     {
         const last_page: *Page = s.pages.pages.last.?.page();
         try testing.expectEqual(
-            @as(usize, s.pages.cols),
+            retained_hyperlinks,
             last_page.hyperlink_set.count(),
         );
     }
 
-    // The dense row is still the bottom row of the active area.
-    for (0..s.pages.cols) |x| {
-        const list_cell = s.pages.getCell(.{ .active = .{
-            .x = @intCast(x),
-            .y = 4,
-        } }).?;
-        try testing.expect(list_cell.cell.hyperlink);
-        const page: *Page = list_cell.node.page();
-        const id = page.lookupHyperlink(list_cell.cell).?;
-        const link = page.hyperlink_set.get(page.memory, id);
-        var buf: [64]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
-        try testing.expectEqualStrings(expected, link.uri.slice(page.memory));
+    // The row remains intact. Retained hyperlinks still resolve correctly.
+    var linked_cells: usize = 0;
+    for (0..s.pages.rows) |y| {
+        for (0..s.pages.cols) |x| {
+            const list_cell = s.pages.getCell(.{ .active = .{
+                .x = @intCast(x),
+                .y = @intCast(y),
+            } }).?;
+            if (!list_cell.cell.hyperlink) continue;
+            linked_cells += 1;
+            const page: *Page = list_cell.node.page();
+            const id = page.lookupHyperlink(list_cell.cell).?;
+            const link = page.hyperlink_set.get(page.memory, id);
+            var buf: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+            try testing.expectEqualStrings(expected, link.uri.slice(page.memory));
+        }
     }
+    try testing.expectEqual(retained_hyperlinks, linked_cells);
 }
 
 test "Screen: scroll above hyperlink-dense row to existing page" {
@@ -6071,6 +6066,9 @@ test "Screen: scroll above hyperlink-dense row to existing page" {
         try s.testWriteString("A");
         s.endHyperlink();
     }
+    const retained_hyperlinks = s.cursor.page_pin.node.page().hyperlink_set.count();
+    try testing.expect(retained_hyperlinks > 0);
+    try testing.expect(retained_hyperlinks < s.pages.cols);
 
     // Scroll twice so the active area straddles the page boundary:
     // the last two active rows are on a second page while the dense
@@ -6106,10 +6104,29 @@ test "Screen: scroll above hyperlink-dense row to existing page" {
     {
         const last_page: *Page = s.pages.pages.last.?.page();
         try testing.expectEqual(
-            @as(usize, s.pages.cols),
+            retained_hyperlinks,
             last_page.hyperlink_set.count(),
         );
     }
+
+    var linked_cells: usize = 0;
+    for (0..s.pages.rows) |y| {
+        for (0..s.pages.cols) |x| {
+            const list_cell = s.pages.getCell(.{ .active = .{
+                .x = @intCast(x),
+                .y = @intCast(y),
+            } }).?;
+            if (!list_cell.cell.hyperlink) continue;
+            linked_cells += 1;
+            const page: *Page = list_cell.node.page();
+            const id = page.lookupHyperlink(list_cell.cell).?;
+            const link = page.hyperlink_set.get(page.memory, id);
+            var buf: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+            try testing.expectEqualStrings(expected, link.uri.slice(page.memory));
+        }
+    }
+    try testing.expectEqual(retained_hyperlinks, linked_cells);
 }
 
 test "Screen: clone" {
@@ -10772,7 +10789,6 @@ test "Screen: hyperlink start/end" {
     }
 }
 
-
 test "Screen: Botster OSC8 capacity pressure does not crash" {
     // Regression: long agent TUI streams with many unique OSC 8 hyperlinks
     // used to SEGV inside increaseCapacity (Botster vt-replay fixture).
@@ -10792,7 +10808,7 @@ test "Screen: Botster OSC8 capacity pressure does not crash" {
         try s.startHyperlink(uri, null);
         s.endHyperlink();
         // Print a cell so page state advances like a real TUI.
-        try s.printString("x");
+        try s.testWriteString("x");
     }
 }
 
@@ -10815,7 +10831,7 @@ test "Screen: Botster unique truecolor style pressure does not crash" {
         const b: u8 = @truncate(i *% 47);
         try s.setAttribute(.{ .direct_color_fg = .{ .r = r, .g = g, .b = b } });
         try s.setAttribute(.{ .direct_color_bg = .{ .r = ~r, .g = ~g, .b = ~b } });
-        try s.printString("x");
+        try s.testWriteString("x");
     }
 }
 
@@ -10944,7 +10960,7 @@ test "Screen: hyperlink cursor state on resize" {
     }
 }
 
-test "Screen: cursorSetHyperlink OOM + URI too large for string alloc" {
+test "Screen: cursorSetHyperlink degrades without capacity growth" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -10958,9 +10974,8 @@ test "Screen: cursorSetHyperlink OOM + URI too large for string alloc" {
     const uri = "a" ** (pagepkg.std_capacity.string_bytes - 8);
     try s.startHyperlink(uri, null);
 
-    // Figure out how many cells should can have hyperlinks in this page,
-    // and write twice that number, to guarantee the capacity needs to be
-    // increased at some point.
+    // Write twice the hyperlink capacity. Entries above the capacity degrade
+    // to cells without hyperlinks.
     const base_capacity = s.cursor.page_pin.node.page().hyperlinkCapacity();
     const base_string_bytes = s.cursor.page_pin.node.capacity().string_bytes;
     for (0..base_capacity * 2) |_| {
@@ -10973,10 +10988,8 @@ test "Screen: cursorSetHyperlink OOM + URI too large for string alloc" {
         }
     }
 
-    // Make sure the capacity really did increase.
-    try testing.expect(base_capacity < s.cursor.page_pin.node.page().hyperlinkCapacity());
-    // And that our string_bytes increased as well.
-    try testing.expect(base_string_bytes < s.cursor.page_pin.node.capacity().string_bytes);
+    try testing.expectEqual(base_capacity, s.cursor.page_pin.node.page().hyperlinkCapacity());
+    try testing.expectEqual(base_string_bytes, s.cursor.page_pin.node.capacity().string_bytes);
 }
 
 test "Screen: increaseCapacity cursor style ref count preserved" {
@@ -11298,10 +11311,7 @@ test "Screen: cursorDown to page with insufficient capacity" {
     }
 }
 
-test "Screen setAttribute increases capacity when style map is full" {
-    // Tests that setAttribute succeeds when the style map is full by
-    // increasing page capacity. When capacity is at max and increaseCapacity
-    // returns OutOfSpace, manualStyleUpdate will split the page instead.
+test "Screen setAttribute degrades when style map is full" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -11334,24 +11344,20 @@ test "Screen setAttribute increases capacity when style map is full" {
         }
     }
 
-    // Now try to set a new unique attribute that would require a new style slot
-    // This should succeed by increasing capacity (or splitting if at max capacity)
+    // Set a new attribute that requires a new style slot.
     try s.setAttribute(.bold);
 
-    // The style should have been applied (bold flag set)
+    // Preserve the requested cursor style, but use the default style ID.
     try testing.expect(s.cursor.style.flags.bold);
+    try testing.expectEqual(style.default_id, s.cursor.style_id);
 
-    // The cursor should have a valid non-default style_id
-    try testing.expect(s.cursor.style_id != style.default_id);
-
-    // Either the capacity increased or the page was split/changed
+    // Do not grow or replace the page under style-map pressure.
     const current_page = s.cursor.page_pin.node.page();
-    const capacity_increased = current_page.capacity.styles > original_styles_capacity;
-    const page_changed = current_page != page;
-    try testing.expect(capacity_increased or page_changed);
+    try testing.expectEqual(original_styles_capacity, current_page.capacity.styles);
+    try testing.expectEqual(page, current_page);
 }
 
-test "Screen setAttribute splits page on OutOfSpace at max styles" {
+test "Screen setAttribute does not split page at max styles" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -11365,9 +11371,6 @@ test "Screen setAttribute splits page on OutOfSpace at max styles" {
 
     // Write content to multiple rows so we have something to split
     try s.testWriteString("line1\nline2\nline3\nline4\nline5");
-
-    // Remember the original node
-    const original_node = s.cursor.page_pin.node;
 
     // Increase the page's style capacity to max by repeatedly calling increaseCapacity
     // Use Screen.increaseCapacity to properly maintain cursor state
@@ -11400,25 +11403,18 @@ test "Screen setAttribute splits page on OutOfSpace at max styles" {
         }
     }
 
-    // Track the node before setAttribute
+    // Track the node before setAttribute.
     const node_before_set = s.cursor.page_pin.node;
 
-    // Now try to set a new unique attribute that would require a new style slot
-    // At max capacity, increaseCapacity will return OutOfSpace, triggering page split
+    // Set a new attribute that requires a new style slot.
     try s.setAttribute(.bold);
 
-    // The style should have been applied (bold flag set)
+    // Preserve the requested cursor style, but use the default style ID.
     try testing.expect(s.cursor.style.flags.bold);
+    try testing.expectEqual(style.default_id, s.cursor.style_id);
 
-    // The cursor should have a valid non-default style_id
-    try testing.expect(s.cursor.style_id != style.default_id);
-
-    // The page should have been split
-    const page_was_split = s.cursor.page_pin.node != node_before_set or
-        node_before_set.next != null or
-        node_before_set.prev != null or
-        s.cursor.page_pin.node != original_node;
-    try testing.expect(page_was_split);
+    // Do not split or replace the page under style-map pressure.
+    try testing.expectEqual(node_before_set, s.cursor.page_pin.node);
 }
 
 test "selectionString map allocation failure cleanup" {

@@ -40,6 +40,7 @@ akimiojr
 alaasdk
 alanmoyano
 alaviss
+alex19ep
 alexbathome
 alexfeijoo44
 alexjuca
@@ -59,6 +60,7 @@ b0uks
 b1nar10
 balazs-szucs
 barutsrb
+basteez
 bch
 bennettp123
 benodiwal
@@ -90,14 +92,19 @@ damyanbogoev
 danneu
 danulqua
 dariogriffo
+dave92082
 davidsanchez222
 deblasis
 dervedro
 devsunb
 diaaeddin
+diego-moment
+diegoarmstrong
 dkinzler
 dmehala
+dmunozv04
 dobbylee
+dolzenko
 doprz
 douglance
 douglas
@@ -106,6 +113,7 @@ drepper
 dzhlobo
 ekaterinepapava
 elias8
+elitex45
 -enkr1
 enzowilliam
 ephemera
@@ -118,6 +126,7 @@ exlee
 -f1813483-netizen
 fallintoplace
 faukah
+figelwump
 filip7
 flou
 fornwall
@@ -248,7 +257,10 @@ pluiedev
 pouwerkerk
 poweruser64
 prakhar54-byte
+preiter93
+prihlop
 priyans-hu
+pssalman
 puzza007
 qappell
 quinnypig
@@ -276,9 +288,12 @@ sanjj1
 secrus
 seruman
 seyoungjeong
+sghng
+shorsher
 silveirapf
 simonbcn
 slsrepo
+steven-tk
 sunshine-syz
 svmhdvn
 tasselx
@@ -291,6 +306,7 @@ ticclick
 tnagatomi
 trag1c
 tristan957
+tsacha
 turbolent
 tweedbeetle
 uhojin
@@ -314,4 +330,5 @@ ydah
 zenangst
 zenyr
 zeshi09
+zlitus
 zubb
